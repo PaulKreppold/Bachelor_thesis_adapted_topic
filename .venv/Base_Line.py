@@ -1,6 +1,6 @@
+import pennylane as qml
 import torch
 import torch.nn as nn
-import pennylane as qml
 
 
 class QuantumModel(nn.Module):
@@ -10,13 +10,10 @@ class QuantumModel(nn.Module):
         self.num_layers = num_layers
         self.dev = qml.device("default.qubit", wires=num_qubits)
 
-        # StronglyEntanglingLayers (3 Parameter pro Qubit)
-        self.weight_shapes = {"params": (self.num_layers, self.num_qubits, 3)}
-
-        # WICHTIG: KEIN nn.Linear Layer!
-        # Wir nutzen stattdessen einen festen Skalierungsfaktor für bessere Konvergenz.
-        # Das ist kein "Layer", sondern ein Hyperparameter wie die Lernrate.
-        self.scale = 5.0
+        # KORREKTUR 1: Weight Shapes anpassen
+        # BasicEntanglerLayers braucht nur 1 Parameter pro Qubit pro Layer
+        # Shape: (num_layers, num_qubits)
+        self.weight_shapes = {"params": (self.num_layers, self.num_qubits)}
 
         self.qnode = self.create_qnode()
         self.quantum_layer = qml.qnn.TorchLayer(self.qnode, self.weight_shapes,
@@ -27,27 +24,24 @@ class QuantumModel(nn.Module):
         def circuit(inputs, params):
             qml.templates.AmplitudeEmbedding(inputs, wires=range(self.num_qubits), normalize=True, pad_with=0.0)
 
-            qml.templates.StronglyEntanglingLayers(params, wires=range(self.num_qubits))
+            # KORREKTUR 2: qml.RY statt 'Y' übergeben
+            qml.templates.BasicEntanglerLayers(params, wires=range(self.num_qubits), rotation=qml.RY)
 
-            # WICHTIG: Wir messen nur Qubit 0 und 1
-            # Qubit 0 = Score für Klasse 0
-            # Qubit 1 = Score für Klasse 1
-            # Die anderen Qubits (2-9) sind "Hidden Units" für die Berechnung
-            return [qml.expval(qml.PauliZ(0)), qml.expval(qml.PauliZ(1))]
+            return qml.expval(qml.PauliZ(0))
 
         return circuit
 
     def forward(self, inputs):
-        # Shape: [batch_size, 2]
-        # Wertebereich: [-1, 1]
-        q_out = self.quantum_layer(inputs)
+        # inputs shape: [batch, 28, 28] -> muss flach sein
+        if inputs.dim() > 2:
+            inputs = inputs.view(inputs.size(0), -1)
 
-        # Falls Batch Size 1 ist, Dimension korrigieren
-        if len(q_out.shape) == 1:
-            q_out = q_out.view(1, -1)
+        exp_val = self.quantum_layer(inputs)
 
-        # Skalierung (nötig für Softmax-Sättigung, aber KEIN lernbarer Parameter)
-        # Damit werden aus [-1, 1] Werte wie [-5, 5], was "starken" Logits entspricht.
-        logits = q_out * self.scale
+        # Umrechnung von Erwartungswert [-1, 1] in Wahrscheinlichkeit [0, 1]
+        # exp_val = +1 (|0>) -> prob = 0
+        # exp_val = -1 (|1>) -> prob = 1
+        prob = (1 - exp_val) / 2
 
-        return logits
+        # Sicherstellen, dass die Dimension [batch, 1] ist für BCELoss
+        return prob.unsqueeze(1).float()

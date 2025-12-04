@@ -1,549 +1,1016 @@
 import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.ticker import FormatStrFormatter
-from sklearn.metrics import ConfusionMatrixDisplay, roc_curve, precision_recall_curve, auc, average_precision_score
-import seaborn as sns
 import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
 import torch
+from collections import Counter
+from sklearn.metrics import ConfusionMatrixDisplay, roc_curve, auc, precision_recall_curve
+from scipy.stats import wilcoxon, mannwhitneyu, spearmanr
 
+# Import aus data_prep
+from data_prep import get_labels_from_dataset
+
+# Styling
+sns.set_style("whitegrid")
+plt.rcParams.update({
+    "axes.grid": True,
+    "grid.linestyle": "--",
+    "grid.alpha": 0.3,
+    "axes.titlesize": 14,
+    "axes.labelsize": 12,
+    "xtick.labelsize": 11,
+    "ytick.labelsize": 11,
+    "lines.linewidth": 1.5,
+    "boxplot.boxprops.linewidth": 1.2,
+    "boxplot.whiskerprops.linewidth": 1.2,
+    "boxplot.capprops.linewidth": 1.2,
+    "boxplot.medianprops.linewidth": 1.5,
+    "boxplot.flierprops.markersize": 4,
+    "figure.figsize": (8, 6)
+})
+
+
+# ============================================================================
+# HILFSFUNKTIONEN
+# ============================================================================
+
+def get_labels_local(dataset):
+    """Alias für get_labels_from_dataset für Rückwärtskompatibilität"""
+    return get_labels_from_dataset(dataset)
+
+
+def get_minority_class(loader):
+    try:
+        labels = get_labels_local(loader.dataset)
+        if len(labels) == 0: return 1
+        c = Counter(labels)
+        return 0 if c.get(0, 0) < c.get(1, 0) else 1
+    except:
+        return 1
+
+
+def get_minority_ratio(loader):
+    labels = get_labels_local(loader.dataset)
+    if len(labels) == 0: return 0.0
+    c = Counter(labels)
+    minority = min(c.values())
+    return minority / len(labels)
+
+
+def identify_skewed_clients(client_train_loaders, threshold=0.3):
+    return [cid for cid, loader in client_train_loaders.items() if get_minority_ratio(loader) < threshold]
+
+
+def styled_boxplot(ax, data_list, labels, width=0.25):
+    """Konsistenter Paper-Style Boxplot"""
+    bp = ax.boxplot(data_list,
+                    patch_artist=True,
+                    labels=labels,
+                    notch=False,
+                    widths=width)
+
+    for box in bp['boxes']:
+        box.set_facecolor('white')
+        box.set_edgecolor('black')
+        box.set_linewidth(1.2)
+
+    for median in bp['medians']:
+        median.set_color('orange')
+        median.set_linewidth(2.0)
+
+    for whisker in bp['whiskers']:
+        whisker.set_color('black')
+        whisker.set_linewidth(1.2)
+
+    for cap in bp['caps']:
+        cap.set_color('black')
+        cap.set_linewidth(1.2)
+
+    for flier in bp['fliers']:
+        flier.set(marker='o', color='black', alpha=0.5, markersize=3)
+        flier.set_markeredgecolor('black')
+
+    return bp
+
+
+# ============================================================================
+# BESTEHENDE PLOT-FUNKTIONEN
+# ============================================================================
 
 def plot_qfl_vs_baseline_accuracy(qfl_accuracies, baseline_accuracies, clients):
-    """
-    Plottet die Trainingsgenauigkeit von QFL vs. Baseline,
-    wobei maximal 4 Clients (in einem 2x2 Grid) pro Seite angezeigt werden.
-    """
+    """Accuracy über Epochen (Mittel ± STD) pro Client."""
+    clients_sorted = sorted(clients)
+    per_page = 4
 
-    clients_sorted = sorted(clients)  # Clients sortieren für eine klare Reihenfolge
-    clients_per_page = 4
-
-    # Clients in Batches von 4 verarbeiten
-    for page_num, i in enumerate(range(0, len(clients_sorted), clients_per_page)):
-
-        clients_batch = clients_sorted[i:i + clients_per_page]
-        num_clients_on_page = len(clients_batch)
-
-        # Grid-Größe für diese Seite festlegen (max. 2x2)
-        if num_clients_on_page <= 2:
-            nrows, ncols = 1, 2
-            figsize = (16, 8)
-        else:
-            nrows, ncols = 2, 2
-            figsize = (16, 14)
-
-        # Abbildung erstellen
-        fig, axes = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False)
+    for i in range(0, len(clients_sorted), per_page):
+        batch = clients_sorted[i:i + per_page]
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
         axes = axes.flatten()
 
-        for idx, client_id in enumerate(clients_batch):
+        for idx, cid in enumerate(batch):
             ax = axes[idx]
 
-            # --- QFL Datenverarbeitung ---
-            qfl_curves = []
-            for seed in qfl_accuracies:
-                qfl_curves.append(qfl_accuracies[seed][client_id])
+            arr_q = np.array([qfl_accuracies[s][cid] for s in qfl_accuracies])
+            min_len = min(len(c) for c in arr_q)
+            arr_q = arr_q[:, :min_len]
+            mu_q, sd_q = arr_q.mean(0), arr_q.std(0)
 
-            min_len_qfl = min(len(c) for c in qfl_curves)
-            qfl_curves_trimmed = np.array([c[:min_len_qfl] for c in qfl_curves])
+            arr_b = np.array([baseline_accuracies[s][cid] for s in baseline_accuracies])
+            min_len_b = min(len(c) for c in arr_b)
+            arr_b = arr_b[:, :min_len_b]
+            mu_b, sd_b = arr_b.mean(0), arr_b.std(0)
 
-            mean_qfl = np.mean(qfl_curves_trimmed, axis=0)
-            std_qfl = np.std(qfl_curves_trimmed, axis=0)
-            epochs_qfl = np.arange(len(mean_qfl))
+            ax.plot(mu_q, label="QFL", color="dodgerblue")
+            ax.fill_between(range(len(mu_q)), mu_q - sd_q, mu_q + sd_q,
+                            alpha=0.25, color="dodgerblue")
 
-            # Plot QFL
-            ax.plot(epochs_qfl, mean_qfl, label="QFL Training", color="dodgerblue")
-            ax.fill_between(epochs_qfl, mean_qfl - std_qfl, mean_qfl + std_qfl,
-                            alpha=0.2, color="dodgerblue")
+            ax.plot(mu_b, label="Baseline", color="darkorange")
+            ax.fill_between(range(len(mu_b)), mu_b - sd_b, mu_b + sd_b,
+                            alpha=0.25, color="darkorange")
 
-            # --- Baseline Datenverarbeitung ---
-            baseline_curves = []
-            for seed in baseline_accuracies:
-                baseline_curves.append(baseline_accuracies[seed][client_id])
-
-            min_len_baseline = min(len(c) for c in baseline_curves)
-            baseline_curves_trimmed = np.array([c[:min_len_baseline] for c in baseline_curves])
-
-            mean_baseline = np.mean(baseline_curves_trimmed, axis=0)
-            std_baseline = np.std(baseline_curves_trimmed, axis=0)
-            epochs_baseline = np.arange(len(mean_baseline))
-
-            # Plot Baseline
-            ax.plot(epochs_baseline, mean_baseline, label="Baseline Training", color="darkorange")
-            ax.fill_between(epochs_baseline, mean_baseline - std_baseline, mean_baseline + std_baseline,
-                            alpha=0.2, color="darkorange")
-
-            # --- Achsen und Beschriftung ---
-            ax.set_title(f"Vergleich für Client {client_id}")
-            ax.set_xlabel("Epochen")
-            ax.set_ylabel("Trainings-Genauigkeit (%)")
-            ax.grid(True, linestyle="--", alpha=0.6)
+            ax.set_title(cid)
+            ax.set_xlabel("Epoch")
+            ax.set_ylabel("Accuracy (%)")
+            ax.grid(True, linestyle="--", alpha=0.4)
             ax.legend()
-            ax.set_ylim(50, 95)  # Konstantes Limit für besseren Vergleich
 
-        # Entferne ungenutzte Subplots auf der letzten Seite (falls weniger als 4 Clients)
-        for j in range(num_clients_on_page, len(axes)):
-            fig.delaxes(axes[j])
+        for k in range(len(batch), 4):
+            fig.delaxes(axes[k])
 
-        # Titel und Layout für die gesamte Seite
-        fig.suptitle(f"QFL vs. Baseline: Trainingsgenauigkeit (Seite {page_num + 1})", fontsize=16)
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-        plt.show()  # Zeige die aktuelle Seite
+        plt.tight_layout()
+        plt.show()
 
 
 def plot_per_client_boxplots(qfl_client_results, baseline_client_results, clients):
-    """
-    Plottet automatisch alle Subclients in 4er-Gruppen pro Seite.
-    Der Base-Client wird automatisch aus dem Subclient-Namen extrahiert.
-    """
-    # Sortiere Clients nach Base-Client und Subclient-Nummer, falls noch nicht sortiert
-    clients_sorted = sorted(clients, key=lambda x: (x.split('_sub')[0], int(x.split('_sub')[1])))
+    """Erstellt separate Plots für jeden Base-Client mit seinen 4 Sub-Clients."""
+    base_clients_dict = {}
+    for cid in clients:
+        try:
+            base = cid.rsplit("_sub", 1)[0]
+            if base not in base_clients_dict:
+                base_clients_dict[base] = []
+            base_clients_dict[base].append(cid)
+        except:
+            print(f"Warning: Konnte {cid} nicht parsen, überspringe.")
+            continue
 
-    # Gehe in 4er-Batches
-    for i in range(0, len(clients_sorted), 4):
-        subclients_batch = clients_sorted[i:i+4]
-        base_client_name = subclients_batch[0].split('_sub')[0]
+    sorted_bases = sorted(base_clients_dict.keys())
+    for base in base_clients_dict:
+        try:
+            base_clients_dict[base] = sorted(
+                base_clients_dict[base],
+                key=lambda x: int(x.rsplit("_sub", 1)[1])
+            )
+        except:
+            base_clients_dict[base] = sorted(base_clients_dict[base])
 
-        num_clients = len(subclients_batch)
-        nrows, ncols = 2, 2
-        fig, axes = plt.subplots(nrows, ncols, figsize=(14, 12), squeeze=False)
+    for base in sorted_bases:
+        sub_clients = base_clients_dict[base]
+        num_subs = len(sub_clients)
+
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
         axes = axes.flatten()
-        box_linewidth = 1.2
 
-        # Für dynamische Skalierung
-        all_qfl_page_values = []
-        all_baseline_page_values = []
-
-        for client_id in subclients_batch:
-            qfl_values = [qfl_client_results[seed][client_id] for seed in qfl_client_results]
-            baseline_values = [baseline_client_results[seed][client_id] for seed in baseline_client_results]
-            all_qfl_page_values.extend(qfl_values)
-            all_baseline_page_values.extend(baseline_values)
-
-        if not all_qfl_page_values or not all_baseline_page_values:
-            min_val, max_val = 60, 85
-        else:
-            min_val = min(min(all_qfl_page_values), min(all_baseline_page_values)) - 1
-            max_val = max(max(all_qfl_page_values), max(all_baseline_page_values)) + 1
-            if max_val - min_val < 5:
-                max_val += 2
-                min_val -= 2
-
-        # Plotten der einzelnen Subclients
-        for idx, client_id in enumerate(subclients_batch):
+        for idx, cid in enumerate(sub_clients):
             ax = axes[idx]
-            qfl_values = [qfl_client_results[seed][client_id] for seed in qfl_client_results]
-            baseline_values = [baseline_client_results[seed][client_id] for seed in baseline_client_results]
 
-            bp = ax.boxplot([qfl_values, baseline_values], patch_artist=True, notch=False)
-            for box in bp['boxes']:
-                box.set(facecolor='white', edgecolor='black', linewidth=box_linewidth)
-            for whisker in bp['whiskers']:
-                whisker.set(color='black', linewidth=box_linewidth)
-            for cap in bp['caps']:
-                cap.set(color='black', linewidth=box_linewidth)
-            for median in bp['medians']:
-                median.set(color='black', linewidth=box_linewidth + 0.5)
-            for flier in bp['fliers']:
-                flier.set(marker='o', markerfacecolor='black', markeredgecolor='black', markersize=5)
+            qfl_values = [qfl_client_results[s][cid]["accuracy"] for s in qfl_client_results]
+            baseline_values = [baseline_client_results[s][cid]["accuracy"] for s in baseline_client_results]
 
-            ax.set_xticklabels(['QFL (globales Modell)', 'Baseline (lokal)'])
-            ax.set_ylabel('Test-Genauigkeit (%)')
-            ax.set_title(f'sub client {client_id}: QFL vs. Baseline')
-            ax.yaxis.grid(True, linestyle='--', alpha=0.25)
-            ax.set_ylim(min_val, max_val)
-            ax.yaxis.set_major_formatter(FormatStrFormatter('%.1f'))
+            styled_boxplot(ax, [qfl_values, baseline_values], ["QFL", "Baseline"], width=0.4)
 
-        for j in range(num_clients, len(axes)):
-            fig.delaxes(axes[j])
+            sub_num = cid.rsplit("_sub", 1)[1]
+            ax.set_ylabel('Test Accuracy', fontsize=11)
+            ax.set_title(f'Sub-Client {sub_num}', fontweight='bold', fontsize=12)
+            ax.set_ylim([0, 1])
+            ax.yaxis.grid(True, linestyle='--', alpha=0.3, color='gray')
+            ax.xaxis.grid(False)
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
 
-        fig.suptitle(f'base client {base_client_name}: Vergleich pro sub client (QFL vs. Baseline)',
-                     fontsize=16)
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-        plt.show()
+        for i in range(num_subs, 4):
+            fig.delaxes(axes[i])
 
-
-
-def plot_stability_boxplot(qfl_results_across_seeds, baseline_results_across_seeds, central_acc_per_seed):
-    # 1. Datenvorbereitung: Sammeln der Seed-Durchschnitte (N=5 pro Liste)
-    qfl_acc_list = list(qfl_results_across_seeds.values())
-    baseline_acc_list = list(baseline_results_across_seeds.values())
-    central_acc_list = list(central_acc_per_seed.values())
-
-    data_to_plot = [qfl_acc_list, baseline_acc_list, central_acc_list]
-
-    # 2. Erstellung und Styling des Boxplots
-    fig, ax = plt.subplots(figsize=(8, 6))
-    bp = ax.boxplot(data_to_plot, patch_artist=True, notch=False)
-
-    box_linewidth = 1.2
-    for box in bp['boxes']:
-        box.set(facecolor='white', edgecolor='black', linewidth=box_linewidth)
-    for whisker in bp['whiskers']:
-        whisker.set(color='black', linewidth=box_linewidth)
-    for cap in bp['caps']:
-        cap.set(color='black', linewidth=box_linewidth)
-    for median in bp['medians']:
-        median.set(color='black', linewidth=box_linewidth + 0.5)
-    for flier in bp['fliers']:
-        flier.set(marker='o', markerfacecolor='black', markeredgecolor='black', markersize=5)
-
-    # 3. Beschriftung anpassen
-    ax.set_xticklabels(['QFL', 'Lokale Baseline', 'Zentrale Baseline'])
-    ax.set_ylabel('Durchschnittliche Test-Genauigkeit (%)')
-    ax.set_title('Vergleich der Algorithmus-Stabilität (Seed-Variabilität)')
-    ax.yaxis.grid(True, linestyle='--', which='major', color='grey', alpha=0.25)
-
-    plt.tight_layout()
-    plt.show()
-
-
-def plot_rsna_auc_stability(qfl_rsna_auc, baseline_rsna_auc, central_rsna_auc):
-    # 1. Datenvorbereitung
-    # Wir nehmen an, die Metriken sind Dictionaries {seed: value}
-    qfl_auc_list = list(qfl_rsna_auc.values())
-    baseline_auc_list = list(baseline_rsna_auc.values())
-    central_auc_list = list(central_rsna_auc.values())
-
-    data_to_plot = [qfl_auc_list, baseline_auc_list, central_auc_list]
-
-    # 2. Erstellung und Styling des Boxplots
-    fig, ax = plt.subplots(figsize=(8, 6))
-
-    # patch_artist=True ist entscheidend für die Füllfarbe
-    bp = ax.boxplot(data_to_plot, patch_artist=True, notch=False)
-
-    # Styling-Code aus plot_global_boxplot übertragen:
-    box_linewidth = 1.2
-
-    # Definiere die Farben für Median und Boxen, um sie schwarz/weiß zu machen
-    for box in bp['boxes']:
-        box.set(facecolor='white', edgecolor='black', linewidth=box_linewidth)
-    for whisker in bp['whiskers']:
-        whisker.set(color='black', linewidth=box_linewidth)
-    for cap in bp['caps']:
-        cap.set(color='black', linewidth=box_linewidth)
-    for median in bp['medians']:
-        median.set(color='black', linewidth=box_linewidth + 0.5)
-    for flier in bp['fliers']:
-        flier.set(marker='o', markerfacecolor='black', markeredgecolor='black', markersize=5)
-
-    # 3. Beschriftung anpassen
-    ax.set_xticklabels(['QFL', 'Lokale Baseline', 'Zentrale Baseline'])
-    ax.set_ylabel('auc score auf externem RSNA Testset')
-    ax.set_title('Vergleich der Algorithmus-Stabilität (AUC Score RSNA)')
-
-    # Hinzufügen der horizontalen Gridlines (wie im ersten Plot)
-    ax.yaxis.grid(True, linestyle='--', which='major', color='grey', alpha=0.25)
-
-    ax.set_ylim(0.5, 1.0)
-
-    plt.tight_layout()
-    plt.show()
-
-
-# --- ANGEPASSTE FUNKTION plot_global_boxplot (20 vs 20 + Linie) ---
-def plot_global_boxplot(qfl_client_results, baseline_client_results, clients, central_overall_mean):
-    all_qfl = [qfl_client_results[seed][client_id]
-               for seed in qfl_client_results for client_id in clients]
-    all_baseline = [baseline_client_results[seed][client_id]
-                    for seed in baseline_client_results for client_id in clients]
-
-    data_to_plot = [all_qfl, all_baseline]
-
-    fig, ax = plt.subplots(figsize=(8, 6))
-    bp = ax.boxplot(data_to_plot, patch_artist=True, notch=False)
-
-    # Styling (Code wie zuvor)
-    box_linewidth = 1.2
-    for box in bp['boxes']:
-        box.set(facecolor='white', edgecolor='black', linewidth=box_linewidth)
-    for whisker in bp['whiskers']:
-        whisker.set(color='black', linewidth=box_linewidth)
-    for cap in bp['caps']:
-        cap.set(color='black', linewidth=box_linewidth)
-    for median in bp['medians']:
-        median.set(color='black', linewidth=box_linewidth + 0.5)
-    for flier in bp['fliers']:
-        flier.set(marker='o', markerfacecolor='black', markeredgecolor='black', markersize=5)
-
-    # NEU: Hinzufügen der zentralen Obergrenze als horizontale Linie
-    ax.axhline(central_overall_mean, color='red', linestyle='--', linewidth=2, label='Zentrale Obergrenze')
-
-    ax.set_xticklabels(['Quantum Federated Learning', 'Baseline (Lokal)'])
-    ax.set_ylabel('Finale Test-Genauigkeit (%)')
-    ax.set_title('Aggregierter Vergleich: QFL vs. Baseline (über alle Clients & Seeds)')
-    ax.yaxis.grid(True, linestyle='--', which='major', color='grey', alpha=0.25)
-    ax.legend(loc='lower right')
-
-    plt.tight_layout()
-    plt.show()
-
-
-def identify_skewed_clients(client_train_loaders, threshold=0.5):
-    """
-    Identifiziert Clients mit stark unbalancierten Klassenverteilungen.
-    Unterstützt RSNADataset, ImagePathDataset, ImageFolder und verschachtelte Subsets.
-    - threshold: minimale Fraction der Minoritätsklasse, die noch als 'ausgeglichen' gilt.
-    """
-    def get_base_dataset_and_indices(ds):
-        """Entpackt rekursiv alle Subsets, bis das Basis-Dataset erreicht ist."""
-        indices = None
-        while isinstance(ds, torch.utils.data.Subset):
-            indices = ds.indices if indices is None else [ds.indices[i] for i in indices]
-            ds = ds.dataset
-        return ds, indices
-
-    def extract_labels(ds, indices=None):
-        """Extrahiert Labels aus einem Dataset, egal ob RSNADataset, ImagePathDataset oder ImageFolder."""
-        if hasattr(ds, "labels"):
-            labels = np.array(ds.labels)
-        elif hasattr(ds, "targets"):
-            labels = np.array(ds.targets)
-        else:
-            # Fallback: versuche label durch direkten Zugriff zu holen
-            try:
-                labels = np.array([ds[i][1] for i in range(len(ds))])
-            except Exception:
-                return None
-        if indices is not None:
-            labels = labels[indices]
-        return labels.astype(int)
-
-    skewed_clients = []
-
-    for cid, loader in client_train_loaders.items():
-        ds = loader.dataset
-        base_ds, indices = get_base_dataset_and_indices(ds)
-        labels = extract_labels(base_ds, indices)
-
-        if labels is None or len(labels) == 0:
-            print(f"[WARNUNG] {cid}: Labels konnten nicht extrahiert werden – übersprungen.")
-            continue
-
-        unique, counts = np.unique(labels, return_counts=True)
-        if len(unique) < 2:
-            print(f"[INFO] {cid}: nur eine Klasse vorhanden – als stark verzerrt markiert.")
-            skewed_clients.append(cid)
-            continue
-        if len(unique) > 2:
-            print(f"[WARNUNG] {cid}: {len(unique)} Klassen gefunden (nicht binär). Überspringe...")
-            continue
-
-        frac_minority = min(counts) / np.sum(counts)
-        print(f"[INFO] {cid}: class_counts={dict(zip(unique, counts))} → minority_frac={frac_minority:.3f} (threshold={threshold})")
-
-        if frac_minority < threshold:
-            skewed_clients.append(cid)
-
-    return skewed_clients
-
-
-
-def plot_confusion_matrix_skewed(qfl_metrics, baseline_metrics, skewed_clients):
-    """
-    Zeigt Confusion-Matrizen (QFL vs. Baseline) für alle skewed clients nebeneinander.
-    """
-    for cid in skewed_clients:
-        if cid not in qfl_metrics or cid not in baseline_metrics:
-            print(f"Client {cid} fehlt in den Ergebnissen – wird übersprungen.")
-            continue
-
-        qfl_cm = qfl_metrics[cid]["confusion_matrix"]
-        base_cm = baseline_metrics[cid]["confusion_matrix"]
-
-        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-        fig.suptitle(f"Client {cid} – Confusion Matrix (QFL vs. Baseline)", fontsize=14)
-
-        ConfusionMatrixDisplay(qfl_cm, display_labels=["Normal", "Pneumonie"]).plot(ax=axes[0], cmap="Blues", colorbar=False)
-        axes[0].set_title("QFL Clientmodell")
-
-        ConfusionMatrixDisplay(base_cm, display_labels=["Normal", "Pneumonie"]).plot(ax=axes[1], cmap="Oranges", colorbar=False)
-        axes[1].set_title("Baseline Modell")
+        fig.suptitle(
+            f'{base.upper()} - QFL vs. Baseline Performance',
+            fontsize=15, fontweight='bold', y=0.995
+        )
 
         plt.tight_layout()
         plt.show()
+        print(f"✓ Plot für {base} erstellt ({num_subs} Sub-Clients)")
 
 
-def plot_roc_pr_skewed(qfl_metrics, baseline_metrics, skewed_clients):
-    """
-    Zeichnet ROC- und Precision/Recall-Kurven für alle skewed Clients.
-    Vergleicht QFL-Clientmodell vs. Baseline-Client.
-    """
-    for cid in skewed_clients:
-        if cid not in qfl_metrics or cid not in baseline_metrics:
-            print(f"Client {cid} fehlt in den Ergebnissen – wird übersprungen.")
+def plot_global_boxplot(qfl_client_results, baseline_client_results, clients, central_mean=None):
+    all_q = [qfl_client_results[s][c]["accuracy"] for s in qfl_client_results for c in clients]
+    all_b = [baseline_client_results[s][c]["accuracy"] for s in baseline_client_results for c in clients]
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    styled_boxplot(ax, [all_q, all_b], ['QFL (Global)', 'Baseline (Local)'], width=0.4)
+
+    if central_mean:
+        ax.axhline(central_mean, color='red', linestyle='--', linewidth=2,
+                   label=f'Centralized ({central_mean:.1f}%)')
+        ax.legend()
+
+    ax.set_title("Global Performance Distribution")
+    ax.set_ylabel("Test Accuracy")
+    plt.show()
+
+
+def plot_minority_f1_boxplots(qfl_client_results, baseline_client_results,
+                              clients, client_train_loaders):
+    sort_key = lambda cid: (cid.split("_sub")[0], int(cid.split("_sub")[1]))
+    try:
+        clients_sorted = sorted(clients, key=sort_key)
+    except:
+        clients_sorted = sorted(clients)
+
+    num_clients = len(clients_sorted)
+    nrows = int(np.ceil(num_clients / 2))
+    ncols = 2 if num_clients > 1 else 1
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(12, 4 * nrows))
+    axes = np.array(axes).flatten() if num_clients > 1 else [axes]
+
+    all_vals_global = []
+
+    for idx, cid in enumerate(clients_sorted):
+        ax = axes[idx]
+        mcls = get_minority_class(client_train_loaders[cid])
+        key = f"f1_class_{mcls}"
+
+        vq = [qfl_client_results[s][cid].get(key, np.nan) for s in qfl_client_results]
+        vb = [baseline_client_results[s][cid].get(key, np.nan) for s in baseline_client_results]
+
+        vq = [x for x in vq if not np.isnan(x)]
+        vb = [x for x in vb if not np.isnan(x)]
+        all_vals_global.extend(vq + vb)
+
+        if len(vq) == 0 and len(vb) == 0:
+            ax.text(0.5, 0.5, "No data", ha="center")
             continue
 
-        # Daten vorbereiten
-        y_true_qfl = np.array(qfl_metrics[cid]["labels"]).flatten()
-        y_probs_qfl = np.array(qfl_metrics[cid]["probs"]).flatten()
-        y_true_base = np.array(baseline_metrics[cid]["labels"]).flatten()
-        y_probs_base = np.array(baseline_metrics[cid]["probs"]).flatten()
+        styled_boxplot(ax, [vq, vb], ["QFL", "Baseline"])
 
-        # ROC
-        fpr_qfl, tpr_qfl, _ = roc_curve(y_true_qfl, y_probs_qfl)
-        fpr_base, tpr_base, _ = roc_curve(y_true_base, y_probs_base)
+        ratio = get_minority_ratio(client_train_loaders[cid])
+        ax.set_title(f"{cid}\n(Minority={mcls}, Ratio={ratio:.2f})")
+        ax.set_ylabel("Minority F1")
+        ax.yaxis.grid(True, linestyle='--', alpha=0.5)
+
+    if all_vals_global:
+        lo = max(0, min(all_vals_global) - 0.05)
+        hi = min(1, max(all_vals_global) + 0.05)
+        for ax in axes: ax.set_ylim(lo, hi)
+
+    for i in range(num_clients, len(axes)):
+        fig.delaxes(axes[i])
+
+    plt.suptitle("Minority-Class F1 under Label Distribution Skew", fontsize=16)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.show()
+
+
+def plot_f1_vs_minority_ratio(qfl_client_results, baseline_client_results, client_train_loaders, seeds):
+    cids = list(client_train_loaders.keys())
+    x = [get_minority_ratio(client_train_loaders[c]) for c in cids]
+
+    y_q_mean, y_q_std = [], []
+    y_b_mean, y_b_std = [], []
+
+    for cid in cids:
+        mcls = get_minority_class(client_train_loaders[cid])
+        key = f"f1_class_{mcls}"
+
+        vals_q = [qfl_client_results[s][cid].get(key, np.nan) for s in seeds]
+        vals_q = [v for v in vals_q if not np.isnan(v)]
+        y_q_mean.append(np.mean(vals_q) if vals_q else np.nan)
+        y_q_std.append(np.std(vals_q) if vals_q else 0)
+
+        vals_b = [baseline_client_results[s][cid].get(key, np.nan) for s in seeds]
+        vals_b = [v for v in vals_b if not np.isnan(v)]
+        y_b_mean.append(np.mean(vals_b) if vals_b else np.nan)
+        y_b_std.append(np.std(vals_b) if vals_b else 0)
+
+    plt.figure(figsize=(7, 6))
+    plt.errorbar(x, y_q_mean, yerr=y_q_std, fmt='o', label="QFL",
+                 color="dodgerblue", alpha=0.7, capsize=4)
+    plt.errorbar(x, y_b_mean, yerr=y_b_std, fmt='o', label="Baseline",
+                 color="darkorange", alpha=0.7, capsize=4)
+    plt.xlabel("Minority Ratio")
+    plt.ylabel("Minority F1")
+    plt.title("F1 vs. Minority Ratio (per Client, mean ± std over seeds)")
+    plt.grid(True, linestyle="--", alpha=0.3)
+    plt.legend()
+    plt.show()
+
+
+def plot_minority_f1_density(qfl_client_results, baseline_client_results, client_train_loaders, seeds):
+    vals_q, vals_b = [], []
+
+    for cid in client_train_loaders:
+        mcls = get_minority_class(client_train_loaders[cid])
+        key = f"f1_class_{mcls}"
+
+        for s in seeds:
+            vq = qfl_client_results[s][cid].get(key, np.nan)
+            vb = baseline_client_results[s][cid].get(key, np.nan)
+            if not np.isnan(vq): vals_q.append(vq)
+            if not np.isnan(vb): vals_b.append(vb)
+
+    plt.figure(figsize=(7, 5))
+    sns.kdeplot(vals_q, label="QFL", color="dodgerblue", fill=True, alpha=0.3)
+    sns.kdeplot(vals_b, label="Baseline", color="darkorange", fill=True, alpha=0.3)
+    plt.xlabel("F1 (Minority)")
+    plt.title("Minority F1 Distribution (all seeds combined)")
+    plt.grid(True, linestyle="--", alpha=0.3)
+    plt.legend()
+    plt.show()
+
+
+def plot_stability_boxplot(qfl_global_metrics, baseline_client_metrics, central_global_metrics):
+    """Plottet Stabilität der Modelle über Seeds."""
+    seeds = list(qfl_global_metrics.keys())
+
+    qfl_vals = [qfl_global_metrics[s]["accuracy"] for s in seeds]
+    qfl_mean = np.mean(qfl_vals)
+    qfl_std = np.std(qfl_vals)
+
+    baseline_means = []
+    baseline_stds = []
+    for s in seeds:
+        client_accs = [v["accuracy"] for v in baseline_client_metrics[s].values()]
+        baseline_means.append(np.mean(client_accs))
+        baseline_stds.append(np.std(client_accs))
+    baseline_mean = np.mean(baseline_means)
+    baseline_std = np.sqrt(np.mean(np.array(baseline_stds) ** 2))
+
+    central_vals = [central_global_metrics[s]["accuracy"] for s in seeds]
+    central_mean = np.mean(central_vals)
+    central_std = np.std(central_vals)
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    labels = ['QFL Global', 'Avg Local', 'Central']
+    means = [qfl_mean, baseline_mean, central_mean]
+    stds = [qfl_std, baseline_std, central_std]
+
+    colors = ['dodgerblue', 'darkorange', 'gray']
+
+    ax.bar(labels, means, yerr=stds, color=colors,
+           alpha=0.8, capsize=6, edgecolor='black', linewidth=1.2)
+
+    ax.set_ylabel("Accuracy (%)")
+    ax.set_title("Model Stability Across Seeds (mean ± std)", fontweight='bold')
+    ax.grid(True, linestyle="--", alpha=0.5, axis='y')
+    plt.show()
+
+
+def plot_auc_heatmap_skewed(qfl_client_results, baseline_client_results, skewed_clients):
+    if not skewed_clients: return
+    deltas = {cid: [] for cid in skewed_clients}
+    for s in qfl_client_results:
+        for cid in skewed_clients:
+            if cid in qfl_client_results[s]:
+                d = qfl_client_results[s][cid]["auc"] - baseline_client_results[s][cid]["auc"]
+                deltas[cid].append(d)
+    data = [{"Client": cid, "Delta AUC": np.mean(vals)} for cid, vals in deltas.items() if vals]
+    if not data: return
+    df = pd.DataFrame(data).set_index("Client")
+    plt.figure(figsize=(5, len(df) * 0.5 + 2))
+    sns.heatmap(df, annot=True, cmap="RdBu", center=0, fmt=".3f", cbar_kws={'label': 'Gain'})
+    plt.title("Avg Delta AUC (QFL - Baseline)")
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_auc_pr_heatmap_skewed(qfl_client_results, baseline_client_results, skewed_clients):
+    if not skewed_clients: return
+    deltas = {cid: [] for cid in skewed_clients}
+    for s in qfl_client_results:
+        for cid in skewed_clients:
+            if cid in qfl_client_results[s]:
+                val_q = qfl_client_results[s][cid].get("auc_pr", 0)
+                val_b = baseline_client_results[s][cid].get("auc_pr", 0)
+                deltas[cid].append(val_q - val_b)
+    data = [{"Client": cid, "Delta AUC-PR": np.mean(vals)} for cid, vals in deltas.items() if vals]
+    if not data: return
+    df = pd.DataFrame(data).set_index("Client")
+    plt.figure(figsize=(5, len(df) * 0.5 + 2))
+    sns.heatmap(df, annot=True, cmap="RdBu", center=0, fmt=".3f", cbar_kws={'label': 'Gain'})
+    plt.title("Avg Delta AUC-PR (QFL - Baseline)")
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_roc_pr_skewed(qfl_client_results, baseline_client_results, skewed_clients, seeds):
+    """
+    Plottet ROC und Precision-Recall Curves für skewed clients.
+    Wichtig: PR-Curves sind bei Imbalance aussagekräftiger als ROC!
+    """
+    if not skewed_clients:
+        print("No skewed clients to plot.")
+        return
+
+    num_clients = len(skewed_clients)
+    fig, axes = plt.subplots(num_clients, 2, figsize=(14, 5 * num_clients))
+
+    # Falls nur 1 skewed client, axes zu 2D array machen
+    if num_clients == 1:
+        axes = axes.reshape(1, -1)
+
+    for idx, cid in enumerate(skewed_clients):
+        ax_roc = axes[idx, 0]
+        ax_pr = axes[idx, 1]
+
+        # Sammle Predictions über alle Seeds
+        qfl_probs_all = []
+        qfl_labels_all = []
+        base_probs_all = []
+        base_labels_all = []
+
+        for seed in seeds:
+            if cid in qfl_client_results[seed]:
+                qfl_probs = qfl_client_results[seed][cid].get('probs', [])
+                qfl_labels = qfl_client_results[seed][cid].get('labels', [])
+
+                base_probs = baseline_client_results[seed][cid].get('probs', [])
+                base_labels = baseline_client_results[seed][cid].get('labels', [])
+
+                if len(qfl_probs) > 0:
+                    qfl_probs_all.extend(qfl_probs)
+                    qfl_labels_all.extend(qfl_labels)
+                    base_probs_all.extend(base_probs)
+                    base_labels_all.extend(base_labels)
+
+        if len(qfl_probs_all) == 0:
+            ax_roc.text(0.5, 0.5, 'No probability data available',
+                        ha='center', va='center', fontsize=12)
+            ax_pr.text(0.5, 0.5, 'No probability data available',
+                       ha='center', va='center', fontsize=12)
+            continue
+
+        # ROC Curve
+        fpr_qfl, tpr_qfl, _ = roc_curve(qfl_labels_all, qfl_probs_all)
+        fpr_base, tpr_base, _ = roc_curve(base_labels_all, base_probs_all)
+
         auc_qfl = auc(fpr_qfl, tpr_qfl)
         auc_base = auc(fpr_base, tpr_base)
 
-        # PR
-        prec_qfl, rec_qfl, _ = precision_recall_curve(y_true_qfl, y_probs_qfl)
-        prec_base, rec_base, _ = precision_recall_curve(y_true_base, y_probs_base)
+        ax_roc.plot(fpr_qfl, tpr_qfl, label=f'QFL (AUC={auc_qfl:.3f})',
+                    color='dodgerblue', linewidth=2)
+        ax_roc.plot(fpr_base, tpr_base, label=f'Baseline (AUC={auc_base:.3f})',
+                    color='darkorange', linewidth=2)
+        ax_roc.plot([0, 1], [0, 1], 'k--', linewidth=1, label='Random')
 
-        # Plotten
-        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-        fig.suptitle(f"Client {cid} – ROC & Precision/Recall", fontsize=14)
+        ax_roc.set_xlabel('False Positive Rate', fontsize=11)
+        ax_roc.set_ylabel('True Positive Rate', fontsize=11)
+        ax_roc.set_title(f'{cid} - ROC Curve', fontweight='bold')
+        ax_roc.legend(loc='lower right')
+        ax_roc.grid(True, linestyle='--', alpha=0.3)
 
-        # ROC
-        axes[0].plot(fpr_qfl, tpr_qfl, label=f"QFL (AUC={auc_qfl:.3f})", color="blue")
-        axes[0].plot(fpr_base, tpr_base, label=f"Baseline (AUC={auc_base:.3f})", color="orange")
-        axes[0].plot([0, 1], [0, 1], "k--", alpha=0.4)
-        axes[0].set_title("ROC Curve")
-        axes[0].set_xlabel("False Positive Rate")
-        axes[0].set_ylabel("True Positive Rate")
-        axes[0].legend()
+        # Precision-Recall Curve
+        prec_qfl, rec_qfl, _ = precision_recall_curve(qfl_labels_all, qfl_probs_all)
+        prec_base, rec_base, _ = precision_recall_curve(base_labels_all, base_probs_all)
 
-        # PR
-        axes[1].plot(rec_qfl, prec_qfl, label="QFL", color="blue")
-        axes[1].plot(rec_base, prec_base, label="Baseline", color="orange")
-        axes[1].set_title("Precision-Recall Curve")
-        axes[1].set_xlabel("Recall")
-        axes[1].set_ylabel("Precision")
-        axes[1].legend()
+        auc_pr_qfl = auc(rec_qfl, prec_qfl)
+        auc_pr_base = auc(rec_base, prec_base)
 
+        ax_pr.plot(rec_qfl, prec_qfl, label=f'QFL (AUC-PR={auc_pr_qfl:.3f})',
+                   color='dodgerblue', linewidth=2)
+        ax_pr.plot(rec_base, prec_base, label=f'Baseline (AUC-PR={auc_pr_base:.3f})',
+                   color='darkorange', linewidth=2)
+
+        # Baseline für PR Curve (Prevalence)
+        prevalence = sum(qfl_labels_all) / len(qfl_labels_all)
+        ax_pr.axhline(prevalence, color='k', linestyle='--', linewidth=1,
+                      label=f'Random (Prev={prevalence:.3f})')
+
+        ax_pr.set_xlabel('Recall (Sensitivity)', fontsize=11)
+        ax_pr.set_ylabel('Precision (PPV)', fontsize=11)
+        ax_pr.set_title(f'{cid} - Precision-Recall Curve', fontweight='bold')
+        ax_pr.legend(loc='lower left')
+        ax_pr.grid(True, linestyle='--', alpha=0.3)
+
+        # Print Summary
+        print(f"\n{cid} Performance:")
+        print(f"  QFL:      AUC-ROC={auc_qfl:.4f} | AUC-PR={auc_pr_qfl:.4f}")
+        print(f"  Baseline: AUC-ROC={auc_base:.4f} | AUC-PR={auc_pr_base:.4f}")
+        print(f"  Δ AUC-ROC: {auc_qfl - auc_base:+.4f}")
+        print(f"  Δ AUC-PR:  {auc_pr_qfl - auc_pr_base:+.4f}")
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_roc_pr_comparison_all_clients(qfl_client_metrics, baseline_client_metrics,
+                                       client_train_loaders, seeds):
+    """
+    Vergleicht ROC und PR Curves ALLER Clients in einem zusammenfassenden Plot.
+    Färbt skewed clients anders ein.
+    """
+    fig, (ax_roc, ax_pr) = plt.subplots(1, 2, figsize=(16, 6))
+
+    skewed_clients = identify_skewed_clients(client_train_loaders, threshold=0.3)
+
+    for cid in client_train_loaders.keys():
+        # Sammle Predictions über alle Seeds
+        qfl_probs_all = []
+        qfl_labels_all = []
+
+        for seed in seeds:
+            if cid in qfl_client_metrics[seed]:
+                qfl_probs = qfl_client_metrics[seed][cid].get('probs', [])
+                qfl_labels = qfl_client_metrics[seed][cid].get('labels', [])
+
+                if len(qfl_probs) > 0:
+                    qfl_probs_all.extend(qfl_probs)
+                    qfl_labels_all.extend(qfl_labels)
+
+        if len(qfl_probs_all) == 0:
+            continue
+
+        # Style basierend auf Skew
+        is_skewed = cid in skewed_clients
+        color = 'red' if is_skewed else 'blue'
+        alpha = 0.8 if is_skewed else 0.3
+        linewidth = 2 if is_skewed else 1
+
+        # ROC Curve
+        fpr, tpr, _ = roc_curve(qfl_labels_all, qfl_probs_all)
+        roc_auc = auc(fpr, tpr)
+
+        label = f'{cid} (AUC={roc_auc:.2f})' if is_skewed else None
+        ax_roc.plot(fpr, tpr, color=color, alpha=alpha, linewidth=linewidth, label=label)
+
+        # PR Curve
+        prec, rec, _ = precision_recall_curve(qfl_labels_all, qfl_probs_all)
+        pr_auc = auc(rec, prec)
+
+        label_pr = f'{cid} (AUC-PR={pr_auc:.2f})' if is_skewed else None
+        ax_pr.plot(rec, prec, color=color, alpha=alpha, linewidth=linewidth, label=label_pr)
+
+    # ROC Plot finalisieren
+    ax_roc.plot([0, 1], [0, 1], 'k--', linewidth=1.5, label='Random')
+    ax_roc.set_xlabel('False Positive Rate', fontsize=12)
+    ax_roc.set_ylabel('True Positive Rate', fontsize=12)
+    ax_roc.set_title('ROC Curves - All Clients (QFL)\nRed = Skewed, Blue = Balanced',
+                     fontweight='bold', fontsize=13)
+    ax_roc.legend(loc='lower right', fontsize=9)
+    ax_roc.grid(True, linestyle='--', alpha=0.3)
+
+    # PR Plot finalisieren
+    ax_pr.set_xlabel('Recall', fontsize=12)
+    ax_pr.set_ylabel('Precision', fontsize=12)
+    ax_pr.set_title('Precision-Recall Curves - All Clients (QFL)\nRed = Skewed, Blue = Balanced',
+                    fontweight='bold', fontsize=13)
+    ax_pr.legend(loc='lower left', fontsize=9)
+    ax_pr.grid(True, linestyle='--', alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_confusion_matrix_skewed(qfl_client_results, baseline_client_results, skewed_clients):
+    if not skewed_clients: return
+    seeds = list(qfl_client_results.keys())
+    for cid in skewed_clients:
+        cm_q = np.zeros((2, 2), dtype=int)
+        cm_b = np.zeros((2, 2), dtype=int)
+        count = 0
+        for s in seeds:
+            if cid in qfl_client_results[s]:
+                cm_q += qfl_client_results[s][cid]["confusion_matrix"]
+                cm_b += baseline_client_results[s][cid]["confusion_matrix"]
+                count += 1
+        if count == 0: continue
+        fig, ax = plt.subplots(1, 2, figsize=(10, 4))
+        ConfusionMatrixDisplay(cm_q, display_labels=["Norm", "Pneu"]).plot(ax=ax[0], cmap="Blues", colorbar=False)
+        ax[0].set_title(f"{cid} QFL (Sum)")
+        ConfusionMatrixDisplay(cm_b, display_labels=["Norm", "Pneu"]).plot(ax=ax[1], cmap="Oranges", colorbar=False)
+        ax[1].set_title(f"{cid} Base (Sum)")
         plt.tight_layout()
         plt.show()
 
 
-def plot_auc_heatmap_skewed(qfl_metrics, baseline_metrics, skewed_clients):
-    """
-    Zeigt Heatmap der AUC-Werte (QFL vs. Baseline) für alle skewed Clients.
-    """
-    data = []
-    for cid in skewed_clients:
-        if cid not in qfl_metrics or cid not in baseline_metrics:
-            continue
-        data.append({
-            "Client": cid,
-            "QFL AUC": qfl_metrics[cid]["auc"],
-            "Baseline AUC": baseline_metrics[cid]["auc"]
-        })
-
-    if not data:
-        print("Keine gültigen Clients für Heatmap gefunden.")
-        return
-
-    df = pd.DataFrame(data).set_index("Client")
-
-    plt.figure(figsize=(6, len(df) * 0.6 + 2))
-    sns.heatmap(df, annot=True, cmap="coolwarm", fmt=".3f")
-    plt.title("AUC-Vergleich (QFL vs. Baseline) – Skewed Clients")
-    plt.xlabel("Modell")
-    plt.ylabel("Client")
-    plt.tight_layout()
-    plt.show()
-
-
-def plot_auc_pr_heatmap_skewed(qfl_metrics, baseline_metrics, skewed_clients):
-    """
-    Zeigt eine Heatmap der gespeicherten AUC-PR-Werte (QFL vs. Baseline) für alle
-    Clients mit Label-Skew. Nutzt die direkt gespeicherten 'auc_pr' Metriken.
-    """
-    data = []
-
-    # 1. Daten aus den gespeicherten Metriken sammeln
-    for cid in skewed_clients:
-        # Prüfung, ob Client-Metriken für den aktuellen Seed vorhanden sind
-        if cid not in qfl_metrics or cid not in baseline_metrics:
-            continue
-
-        # Abruf der gespeicherten AUC-PR Werte
-        # (Fehlerbehandlung: Prüfen, ob der Schlüssel 'auc_pr' existiert)
-        auc_pr_qfl = qfl_metrics[cid].get("auc_pr", np.nan)
-        auc_pr_base = baseline_metrics[cid].get("auc_pr", np.nan)
-
-        data.append({
-            "Client": cid,
-            "QFL AUC-PR": auc_pr_qfl,
-            "Baseline AUC-PR": auc_pr_base
-        })
-
-    if not data:
-        print("Keine gültigen Clients für AUC-PR Heatmap gefunden.")
-        return
-
-    # 2. DataFrame erstellen und Heatmap plotten
-    df = pd.DataFrame(data).set_index("Client")
-
-    plt.figure(figsize=(6, len(df) * 0.6 + 2))
-    # 'viridis' ist eine gute Farbskala für kontinuierliche Daten
-    sns.heatmap(df, annot=True, cmap="viridis", fmt=".3f", vmin=0.5)
-    plt.title("AUC-PR Vergleich (QFL vs. Baseline) – Skewed Clients")
-    plt.xlabel("Modell")
-    plt.ylabel("Client")
-    plt.tight_layout()
-    plt.show()
-
-def compute_bias_summary(qfl_client_metrics, baseline_client_metrics, qfl_rsna_metrics, central_global_metrics, seeds):
-
-    bias_results = {}
-
-    print("\n\n BIAS & FAIRNESS ANALYSE\n")
+def compute_bias_summary(qfl_client_metrics, baseline_client_metrics, qfl_external_metrics,
+                         central_global_metrics, seeds, client_train_loaders=None):
+    """Erweiterte Bias/Fairness Analyse mit statistischen Tests."""
+    records = []
 
     for seed in seeds:
-        qfl_clients = qfl_client_metrics[seed]
-        base_clients = baseline_client_metrics[seed]
-        rsna_qfl = qfl_rsna_metrics[seed]
-        central_rsna = central_global_metrics[seed]
+        for cid in qfl_client_metrics[seed]:
+            qfl_m = qfl_client_metrics[seed][cid]
+            base_m = baseline_client_metrics[seed][cid]
 
-        # Client-Heterogenität
-        f1_qfl_values = np.array([m["f1"] for m in qfl_clients.values()])
-        f1_base_values = np.array([m["f1"] for m in base_clients.values()])
-        auc_qfl_values = np.array([m["auc"] for m in qfl_clients.values()])
+            client_data = {
+                "Seed": seed,
+                "Client": cid,
+                "QFL_ACC": qfl_m["accuracy"],
+                "QFL_F1": qfl_m["f1"],
+                "Baseline_ACC": base_m["accuracy"],
+                "Baseline_F1": base_m["f1"],
+                "ACC_Gain": qfl_m["accuracy"] - base_m["accuracy"],
+                "F1_Gain": qfl_m["f1"] - base_m["f1"],
+            }
 
-        f1_var_qfl = np.std(f1_qfl_values)
-        f1_var_base = np.std(f1_base_values)
+            if client_train_loaders and cid in client_train_loaders:
+                labels = get_labels_from_dataset(client_train_loaders[cid].dataset)
+                counts = Counter(labels)
+                n_minority = counts.get(1, 0)
+                n_total = len(labels)
+                client_data["Minority_Ratio"] = n_minority / max(n_total, 1)
+            else:
+                client_data["Minority_Ratio"] = None
 
-        # Delta Global vs. Local (pro Client)
-        delta_f1 = np.mean([qfl_clients[cid]["f1"] - base_clients[cid]["f1"] for cid in qfl_clients])
-        delta_auc = np.mean([qfl_clients[cid]["auc"] - base_clients[cid]["auc"] for cid in qfl_clients])
+            records.append(client_data)
 
-        # RSNA Generalization Gap
-        f1_global_rsna = rsna_qfl["global_model"]["f1"]
-        f1_central_rsna = central_rsna["f1"]
-        avg_f1_clients = np.mean(f1_qfl_values)
-        generalization_gap = avg_f1_clients - f1_global_rsna
+    df = pd.DataFrame(records)
 
-        # Precision/Recall Imbalance
-        imbalance_qfl = np.mean([abs(m["precision"] - m["recall"]) for m in qfl_clients.values()])
-        imbalance_base = np.mean([abs(m["precision"] - m["recall"]) for m in base_clients.values()])
+    # Statistische Analyse
+    print("\n" + "=" * 80)
+    print("📊 BIAS & FAIRNESS SUMMARY")
+    print("=" * 80)
+    print(f"\nDataset: {len(df)} experiments ({len(seeds)} seeds × {len(df) // len(seeds)} clients)")
+    print(f"\nOverall Performance:")
+    print(
+        f"  QFL:      ACC={df['QFL_ACC'].mean():.3f}±{df['QFL_ACC'].std():.3f} | F1={df['QFL_F1'].mean():.3f}±{df['QFL_F1'].std():.3f}")
+    print(
+        f"  Baseline: ACC={df['Baseline_ACC'].mean():.3f}±{df['Baseline_ACC'].std():.3f} | F1={df['Baseline_F1'].mean():.3f}±{df['Baseline_F1'].std():.3f}")
+    print(
+        f"  Gain:     ACC={df['ACC_Gain'].mean():.3f}±{df['ACC_Gain'].std():.3f} | F1={df['F1_Gain'].mean():.3f}±{df['F1_Gain'].std():.3f}")
 
-        bias_results[seed] = {
-            "F1_Var_QFL": f1_var_qfl,
-            "F1_Var_Baseline": f1_var_base,
-            "ΔF1_QFL-Base": delta_f1,
-            "ΔAUC_QFL-Base": delta_auc,
-            "RSNA_Gap_F1": generalization_gap,
-            "Precision/Recall_Imbalance_QFL": imbalance_qfl,
-            "Precision/Recall_Imbalance_Base": imbalance_base,
-            "Central_RSNA_F1": f1_central_rsna
-        }
+    # Wilcoxon Test
+    try:
+        _, p_acc = wilcoxon(df['QFL_ACC'], df['Baseline_ACC'])
+        _, p_f1 = wilcoxon(df['QFL_F1'], df['Baseline_F1'])
+        print(f"\nStatistical Significance (Wilcoxon):")
+        print(f"  Accuracy: p={p_acc:.4f} {'✓ Significant' if p_acc < 0.05 else '✗ Not significant'}")
+        print(f"  F1:       p={p_f1:.4f} {'✓ Significant' if p_f1 < 0.05 else '✗ Not significant'}")
+    except:
+        print("\nStatistical test failed (likely identical distributions)")
 
-        print(f"\n Seed {seed}")
-        print(f"  • Client-Heterogenität (σ F1): QFL={f1_var_qfl:.4f} | Baseline={f1_var_base:.4f}")
-        print(f"  • Δ(QFL - Baseline): F1={delta_f1:+.3f} | AUC={delta_auc:+.3f}")
-        print(f"  • RSNA Generalization Gap (avg client F1 → RSNA): {generalization_gap:+.3f}")
-        print(f"  • Precision/Recall Imbalance: QFL={imbalance_qfl:.3f} | Baseline={imbalance_base:.3f}")
-        print(f"  • Central RSNA F1: {f1_central_rsna:.3f}")
+    # Win Rate
+    print(f"\nWin Rate (QFL > Baseline):")
+    print(f"  Accuracy: {(df['ACC_Gain'] > 0).sum()}/{len(df)} ({100 * (df['ACC_Gain'] > 0).mean():.1f}%)")
+    print(f"  F1:       {(df['F1_Gain'] > 0).sum()}/{len(df)} ({100 * (df['F1_Gain'] > 0).mean():.1f}%)")
 
-    print("\n Aggregierte Bias-Statistik über alle Seeds:")
-    df_bias = pd.DataFrame(bias_results).T
-    print(df_bias.round(4).to_string())
+    print("=" * 80 + "\n")
+    print(df.head(12))
 
-    print("\n Interpretation:")
-    print(" Niedrigere F1-Varianz → homogenere Performance (weniger client bias).")
-    print(" Positives ΔF1 → QFL übertrifft lokale Baselines (kollektive Verbesserung).")
-    print(" Kleinerer RSNA-Gap → bessere Generalisierung auf externe Domäne.")
-    print(" Kleinere Precision/Recall-Differenz → besser kalibriertes Modell (weniger Label-Bias).")
+    return df
 
-    return df_bias
 
+# ============================================================================
+# NEUE LDS-SPEZIFISCHE FUNKTIONEN
+# ============================================================================
+
+def plot_skewed_vs_balanced_comparison(qfl_client_metrics, baseline_client_metrics,
+                                       client_train_loaders, seeds, skew_threshold=0.3):
+    """
+    Vergleicht Performance zwischen stark skewed (<30% minority) und balanced Clients.
+    KERNFRAGE: Profitieren skewed clients MEHR von QFL?
+    """
+    skewed_clients = []
+    balanced_clients = []
+
+    for cid, loader in client_train_loaders.items():
+        labels = get_labels_from_dataset(loader.dataset)
+        counts = Counter(labels)
+        minority_ratio = min(counts.values()) / len(labels)
+
+        if minority_ratio < skew_threshold:
+            skewed_clients.append(cid)
+        else:
+            balanced_clients.append(cid)
+
+    # F1 Scores sammeln
+    data = []
+    for seed in seeds:
+        for cid in skewed_clients:
+            data.append({
+                'Seed': seed,
+                'Client_Type': 'Skewed',
+                'Client': cid,
+                'QFL_F1': qfl_client_metrics[seed][cid]['f1'],
+                'Baseline_F1': baseline_client_metrics[seed][cid]['f1'],
+                'F1_Gain': qfl_client_metrics[seed][cid]['f1'] - baseline_client_metrics[seed][cid]['f1']
+            })
+
+        for cid in balanced_clients:
+            data.append({
+                'Seed': seed,
+                'Client_Type': 'Balanced',
+                'Client': cid,
+                'QFL_F1': qfl_client_metrics[seed][cid]['f1'],
+                'Baseline_F1': baseline_client_metrics[seed][cid]['f1'],
+                'F1_Gain': qfl_client_metrics[seed][cid]['f1'] - baseline_client_metrics[seed][cid]['f1']
+            })
+
+    df = pd.DataFrame(data)
+
+    # Plotting
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+    # Plot 1: F1 Comparison
+    ax1 = axes[0]
+    df_melted = df.melt(id_vars=['Client_Type', 'Seed'],
+                        value_vars=['QFL_F1', 'Baseline_F1'],
+                        var_name='Method', value_name='F1')
+
+    sns.boxplot(data=df_melted, x='Client_Type', y='F1', hue='Method', ax=ax1)
+    ax1.set_title('F1 Score: Skewed vs. Balanced Clients', fontweight='bold', fontsize=14)
+    ax1.set_ylabel('F1 Score', fontsize=12)
+    ax1.legend(title='Method')
+    ax1.grid(True, linestyle='--', alpha=0.3)
+
+    # Plot 2: F1 Gain
+    ax2 = axes[1]
+    sns.boxplot(data=df, x='Client_Type', y='F1_Gain', ax=ax2, color='steelblue')
+    ax2.axhline(0, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
+    ax2.set_title('F1 Improvement (QFL - Baseline)', fontweight='bold', fontsize=14)
+    ax2.set_ylabel('ΔF1', fontsize=12)
+    ax2.grid(True, linestyle='--', alpha=0.3)
+
+    # Plot 3: Per-Client F1 Gain
+    ax3 = axes[2]
+    df_gain_mean = df.groupby(['Client_Type', 'Client'])['F1_Gain'].mean().reset_index()
+    df_gain_mean = df_gain_mean.sort_values('F1_Gain', ascending=False)
+
+    colors = ['red' if ct == 'Skewed' else 'green' for ct in df_gain_mean['Client_Type']]
+    ax3.barh(df_gain_mean['Client'], df_gain_mean['F1_Gain'], color=colors, alpha=0.7)
+    ax3.axvline(0, color='black', linestyle='-', linewidth=1)
+    ax3.set_xlabel('Average F1 Gain', fontsize=12)
+    ax3.set_title('Per-Client F1 Improvement', fontweight='bold', fontsize=14)
+    ax3.grid(True, linestyle='--', alpha=0.3, axis='x')
+
+    plt.tight_layout()
+    plt.show()
+
+    # Statistical Analysis
+    print("\n" + "=" * 80)
+    print("📊 SKEWED vs. BALANCED CLIENTS ANALYSIS")
+    print("=" * 80)
+
+    skewed_gain = df[df['Client_Type'] == 'Skewed']['F1_Gain']
+    balanced_gain = df[df['Client_Type'] == 'Balanced']['F1_Gain']
+
+    print(f"\nSkewed Clients (n={len(skewed_clients)}):")
+    print(f"  F1 Gain: {skewed_gain.mean():.4f} ± {skewed_gain.std():.4f}")
+    print(f"  Win Rate: {(skewed_gain > 0).mean() * 100:.1f}%")
+
+    print(f"\nBalanced Clients (n={len(balanced_clients)}):")
+    print(f"  F1 Gain: {balanced_gain.mean():.4f} ± {balanced_gain.std():.4f}")
+    print(f"  Win Rate: {(balanced_gain > 0).mean() * 100:.1f}%")
+
+    # Mann-Whitney U Test
+    stat, p = mannwhitneyu(skewed_gain, balanced_gain)
+    print(f"\nMann-Whitney U Test:")
+    print(f"  p-value: {p:.4f}")
+    if p < 0.05:
+        if skewed_gain.mean() > balanced_gain.mean():
+            print("  ✓ Skewed clients benefit SIGNIFICANTLY MORE from QFL!")
+        else:
+            print("  ✓ Balanced clients benefit more (unexpected)")
+    else:
+        print("  ✗ No significant difference between groups")
+
+    print("=" * 80 + "\n")
+
+    return df
+
+
+def plot_class_specific_performance(qfl_client_metrics, baseline_client_metrics,
+                                    client_train_loaders, seeds):
+    """
+    Zeigt Performance für JEDE Klasse einzeln.
+    Wichtig: Bei LDS leidet meist die Minority-Klasse.
+    """
+    data = []
+
+    for seed in seeds:
+        for cid, loader in client_train_loaders.items():
+            labels = get_labels_from_dataset(loader.dataset)
+            counts = Counter(labels)
+            minority_class = 0 if counts.get(0, 0) < counts.get(1, 0) else 1
+            majority_class = 1 - minority_class
+
+            qfl_m = qfl_client_metrics[seed][cid]
+            base_m = baseline_client_metrics[seed][cid]
+
+            # Majority Class
+            data.append({
+                'Seed': seed,
+                'Client': cid,
+                'Class': 'Majority',
+                'Class_Label': majority_class,
+                'QFL_F1': qfl_m.get(f'f1_class_{majority_class}', np.nan),
+                'Baseline_F1': base_m.get(f'f1_class_{majority_class}', np.nan),
+                'Minority_Ratio': min(counts.values()) / len(labels)
+            })
+
+            # Minority Class
+            data.append({
+                'Seed': seed,
+                'Client': cid,
+                'Class': 'Minority',
+                'Class_Label': minority_class,
+                'QFL_F1': qfl_m.get(f'f1_class_{minority_class}', np.nan),
+                'Baseline_F1': base_m.get(f'f1_class_{minority_class}', np.nan),
+                'Minority_Ratio': min(counts.values()) / len(labels)
+            })
+
+    df = pd.DataFrame(data).dropna()
+    df['F1_Gain'] = df['QFL_F1'] - df['Baseline_F1']
+
+    # Plotting
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+    # Plot 1: F1 Score by Class
+    ax1 = axes[0]
+    df_melted = df.melt(id_vars=['Class', 'Seed'],
+                        value_vars=['QFL_F1', 'Baseline_F1'],
+                        var_name='Method', value_name='F1')
+
+    sns.violinplot(data=df_melted, x='Class', y='F1', hue='Method', ax=ax1, split=True)
+    ax1.set_title('Class-Specific F1 Performance', fontweight='bold', fontsize=14)
+    ax1.set_ylabel('F1 Score', fontsize=12)
+    ax1.grid(True, linestyle='--', alpha=0.3, axis='y')
+
+    # Plot 2: F1 Gain by Class
+    ax2 = axes[1]
+    sns.boxplot(data=df, x='Class', y='F1_Gain', ax=ax2, palette='Set2')
+    ax2.axhline(0, color='red', linestyle='--', linewidth=1.5)
+    ax2.set_title('F1 Improvement by Class (QFL - Baseline)', fontweight='bold', fontsize=14)
+    ax2.set_ylabel('ΔF1', fontsize=12)
+    ax2.grid(True, linestyle='--', alpha=0.3, axis='y')
+
+    plt.tight_layout()
+    plt.show()
+
+    # Analysis
+    print("\n" + "=" * 80)
+    print("📊 CLASS-SPECIFIC PERFORMANCE ANALYSIS")
+    print("=" * 80)
+
+    for class_type in ['Majority', 'Minority']:
+        subset = df[df['Class'] == class_type]
+        print(f"\n{class_type} Class:")
+        print(f"  QFL F1:      {subset['QFL_F1'].mean():.4f} ± {subset['QFL_F1'].std():.4f}")
+        print(f"  Baseline F1: {subset['Baseline_F1'].mean():.4f} ± {subset['Baseline_F1'].std():.4f}")
+        print(f"  F1 Gain:     {subset['F1_Gain'].mean():.4f} ± {subset['F1_Gain'].std():.4f}")
+
+        # Wilcoxon Test
+        try:
+            _, p = wilcoxon(subset['QFL_F1'], subset['Baseline_F1'])
+            print(f"  p-value:     {p:.4f} {'✓ Significant' if p < 0.05 else '✗ Not significant'}")
+        except:
+            print(f"  p-value:     Could not compute")
+
+    print("=" * 80 + "\n")
+
+    return df
+
+
+def plot_skew_severity_analysis(qfl_client_metrics, baseline_client_metrics,
+                                client_train_loaders, seeds):
+    """
+    Korrelation: Je stärker der Skew, desto mehr profitiert man von QFL?
+    """
+    data = []
+
+    for cid, loader in client_train_loaders.items():
+        labels = get_labels_from_dataset(loader.dataset)
+        counts = Counter(labels)
+        minority_ratio = min(counts.values()) / len(labels)
+
+        # Skew Severity = Abweichung von 50%
+        skew_severity = abs(0.5 - minority_ratio)
+
+        for seed in seeds:
+            qfl_f1 = qfl_client_metrics[seed][cid]['f1']
+            base_f1 = baseline_client_metrics[seed][cid]['f1']
+
+            data.append({
+                'Client': cid,
+                'Seed': seed,
+                'Minority_Ratio': minority_ratio,
+                'Skew_Severity': skew_severity,
+                'F1_Gain': qfl_f1 - base_f1,
+                'QFL_F1': qfl_f1,
+                'Baseline_F1': base_f1
+            })
+
+    df = pd.DataFrame(data)
+
+    # Correlation
+    corr, p_value = spearmanr(df['Skew_Severity'], df['F1_Gain'])
+
+    # Plotting
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+    # Plot 1: Scatter with Regression
+    ax1 = axes[0]
+    for seed in seeds:
+        subset = df[df['Seed'] == seed]
+        ax1.scatter(subset['Skew_Severity'], subset['F1_Gain'],
+                    alpha=0.6, s=100, label=f'Seed {seed}')
+
+    # Regression Line
+    z = np.polyfit(df['Skew_Severity'], df['F1_Gain'], 1)
+    p = np.poly1d(z)
+    x_line = np.linspace(df['Skew_Severity'].min(), df['Skew_Severity'].max(), 100)
+    ax1.plot(x_line, p(x_line), 'r--', linewidth=2, label=f'Trend (ρ={corr:.3f})')
+
+    ax1.axhline(0, color='black', linestyle='-', linewidth=1, alpha=0.5)
+    ax1.set_xlabel('Skew Severity (|0.5 - Minority Ratio|)', fontsize=12)
+    ax1.set_ylabel('F1 Improvement (QFL - Baseline)', fontsize=12)
+    ax1.set_title(f'Skew Severity vs. F1 Gain\n(Spearman ρ={corr:.3f}, p={p_value:.4f})',
+                  fontweight='bold', fontsize=14)
+    ax1.legend()
+    ax1.grid(True, linestyle='--', alpha=0.3)
+
+    # Plot 2: Binned Analysis
+    ax2 = axes[1]
+    df['Skew_Bin'] = pd.cut(df['Skew_Severity'],
+                            bins=[0, 0.1, 0.2, 0.3, 0.5],
+                            labels=['Mild (<10%)', 'Moderate (10-20%)',
+                                    'Severe (20-30%)', 'Extreme (>30%)'])
+
+    sns.boxplot(data=df, x='Skew_Bin', y='F1_Gain', ax=ax2, palette='RdYlGn_r')
+    ax2.axhline(0, color='red', linestyle='--', linewidth=1.5)
+    ax2.set_xlabel('Skew Severity Category', fontsize=12)
+    ax2.set_ylabel('F1 Improvement', fontsize=12)
+    ax2.set_title('F1 Gain by Skew Severity', fontweight='bold', fontsize=14)
+    ax2.grid(True, linestyle='--', alpha=0.3, axis='y')
+
+    plt.tight_layout()
+    plt.show()
+
+    # Analysis
+    print("\n" + "=" * 80)
+    print("📊 SKEW SEVERITY vs. IMPROVEMENT ANALYSIS")
+    print("=" * 80)
+    print(f"\nSpearman Correlation: ρ = {corr:.4f}, p = {p_value:.4f}")
+
+    if p_value < 0.05:
+        if corr > 0:
+            print("✓ POSITIVE correlation: Stronger skew → MORE benefit from QFL")
+        else:
+            print("✓ NEGATIVE correlation: Stronger skew → LESS benefit (unexpected)")
+    else:
+        print("✗ No significant correlation between skew severity and QFL benefit")
+
+    print("\nF1 Gain by Severity:")
+    for bin_name in df['Skew_Bin'].cat.categories:
+        subset = df[df['Skew_Bin'] == bin_name]
+        if len(subset) > 0:
+            print(f"  {bin_name}: {subset['F1_Gain'].mean():.4f} ± {subset['F1_Gain'].std():.4f}")
+
+    print("=" * 80 + "\n")
+
+    return df
+
+
+def analyze_lds_resilience(qfl_client_metrics, baseline_client_metrics,
+                           client_train_loaders, seeds, skew_threshold=0.3):
+    """
+    Führt ALLE LDS-relevanten Analysen durch.
+    Master-Funktion für vollständige Label Distribution Skew Analyse.
+
+    Returns:
+        dict mit allen Ergebnissen für Thesis-Tabellen
+    """
+    print("\n" + "=" * 80)
+    print("🔬 COMPREHENSIVE LABEL DISTRIBUTION SKEW ANALYSIS")
+    print("=" * 80)
+
+    # 1. Skewed vs. Balanced
+    print("\n[1/3] Analyzing Skewed vs. Balanced Clients...")
+    df_comparison = plot_skewed_vs_balanced_comparison(
+        qfl_client_metrics, baseline_client_metrics,
+        client_train_loaders, seeds, skew_threshold
+    )
+
+    # 2. Class-Specific Performance
+    print("\n[2/3] Analyzing Class-Specific Performance...")
+    df_class = plot_class_specific_performance(
+        qfl_client_metrics, baseline_client_metrics,
+        client_train_loaders, seeds
+    )
+
+    # 3. Skew Severity vs. Improvement
+    print("\n[3/3] Analyzing Skew Severity Impact...")
+    df_severity = plot_skew_severity_analysis(
+        qfl_client_metrics, baseline_client_metrics,
+        client_train_loaders, seeds
+    )
+
+    print("\n" + "=" * 80)
+    print("✅ COMPLETE LDS ANALYSIS FINISHED")
+    print("=" * 80 + "\n")
+
+    return {
+        'comparison': df_comparison,
+        'class_specific': df_class,
+        'severity': df_severity
+    }

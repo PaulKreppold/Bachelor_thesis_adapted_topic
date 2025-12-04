@@ -1,151 +1,27 @@
-import glob
 import os
-import numpy as np
-import pandas as pd
+import glob
 import random
-from PIL import Image
+import numpy as np
 import torch
-import cv2
-from torch.utils.data import Dataset, DataLoader, Subset, random_split, ConcatDataset
+from torch.utils.data import Dataset, DataLoader, Subset
 from torchvision import datasets, transforms
-from sklearn.model_selection import train_test_split
-from medmnist import PneumoniaMNIST
+from PIL import Image
+from collections import Counter
 
-# Globale Pfaddefinitionen
-Pneumonia_Datasets_PATH = '/Users/paulkreppold/Library/Mobile Documents/com~apple~CloudDocs/bachelor thesis/Pneumonia_datasets'
-RSNA_BASE_PATH = '/Users/paulkreppold/Library/Mobile Documents/com~apple~CloudDocs/bachelor thesis/RSNA_Pneumonia_Detection_Challenge'
-EXTERNAL_DATA_PATH = '/Users/paulkreppold/Library/Mobile Documents/com~apple~CloudDocs/bachelor thesis/Covid19-Pneumonia-Normal Chest X-Ray Images Dataset_mendely_data'
+# ======================================================
+# 1. PFAD-KONFIGURATION
+# ======================================================
+BASE_DIR = '/Users/paulkreppold/Library/Mobile Documents/com~apple~CloudDocs/bachelor thesis'
 
-
-class RSNADataset(Dataset):
-    def __init__(self, images_dir, metadata_csv, transform=None):
-        self.images_dir = images_dir
-        self.transform = transform
-
-        # 1. CSV laden
-        df = pd.read_csv(metadata_csv)
-
-        # Debugging: Zeige uns kurz, welche Spalten da sind, falls Fehler auftreten
-        print(f"[DEBUG] Spalten in CSV: {list(df.columns)}")
-
-        # 2. Die Spalte mit dem Klassennamen finden
-        # Deine Zeile: "id, ..., 0, No Lung Opacity / Not Normal, ..."
-        # Wir suchen die Spalte, die diesen Text enthält. Meist heißt sie 'class'.
-        class_col = None
-        if 'class' in df.columns:
-            class_col = 'class'
-        elif 'Class' in df.columns:
-            class_col = 'Class'
-        else:
-            # Fallback: Wir suchen die Spalte, die den Text enthält
-            for col in df.columns:
-                # Checke den ersten Eintrag (oder einen beliebigen), ob er String ist
-                if df[col].dtype == object:
-                    if df[col].str.contains('Lung Opacity').any():
-                        class_col = col
-                        break
-
-        if class_col is None:
-            raise KeyError("Konnte die Spalte mit 'Normal' / 'Lung Opacity' nicht automatisch finden.")
-
-        print(f"[INFO] Nutze Spalte '{class_col}' zum Filtern.")
-        print(f"[RSNA RAW] Gesamtanzahl Bilder: {len(df)}")
-
-        # 3. FILTERN (Der entscheidende Schritt)
-        # Wir behalten nur: 'Normal' UND 'Lung Opacity'
-        # Wir löschen: 'No Lung Opacity / Not Normal'
-        df_clean = df[df[class_col].isin(['Normal', 'Lung Opacity'])].copy()
-
-        # Duplikate entfernen (falls mehrere Boxen pro Bild gelistet sind, brauchen wir das Bild trotzdem nur einmal)
-        df_clean = df_clean.drop_duplicates(subset=['patientId'])
-
-        print(f"[RSNA CLEANED] Nur Normal/Pneumonia: {len(df_clean)}")
-        print(f"               Entfernt (Andere Erkrankungen): {len(df) - len(df_clean)}")
-
-        # 4. Daten zuweisen
-        self.image_ids = df_clean['patientId'].values
-
-        # Wir setzen die Labels basierend auf dem Text, um 100% sicher zu sein
-        # Normal -> 0
-        # Lung Opacity -> 1
-        self.labels = df_clean[class_col].apply(lambda x: 1 if x == 'Lung Opacity' else 0).values.astype(np.int64)
-
-        # Optionaler Pfad-Check (kann man auskommentieren, wenn es zu lange dauert)
-        self.valid_indices = []
-        for i, pid in enumerate(self.image_ids):
-            # Prüfen auf .png (da du sagtest, du hast den Ordner "Images" konvertiert)
-            if os.path.exists(os.path.join(images_dir, f"{pid}.png")):
-                self.valid_indices.append(i)
-
-        self.image_ids = self.image_ids[self.valid_indices]
-        self.labels = self.labels[self.valid_indices]
-
-        # Verteilung anzeigen
-        neg = np.sum(self.labels == 0)
-        pos = np.sum(self.labels == 1)
-        print(f"[FINAL] Valid Dataset: {len(self.image_ids)} Bilder. (Gesund: {neg}, Pneumonie: {pos})")
-
-    def __len__(self):
-        return len(self.image_ids)
-
-    def __getitem__(self, idx):
-        img_id = self.image_ids[idx]
-        label = self.labels[idx]
-
-        img_path = os.path.join(self.images_dir, f"{img_id}.png")
-
-        try:
-            image = Image.open(img_path).convert('L')
-            if self.transform:
-                image = self.transform(image)
-            return image, label
-        except Exception as e:
-            print(f"Error loading {img_path}: {e}")
-            return None, label
+Pneumonia_Datasets_PATH = os.path.join(BASE_DIR, 'Pneumonia_datasets')
+EXTERNAL_DATA_PATH = os.path.join(BASE_DIR, 'Covid19-Pneumonia-Normal Chest X-Ray Images Dataset_mendely_data')
 
 
-class RSNAPreprocessingTransform:
-    def __init__(self, output_size=32, crop_factor=0.8):
-        self.output_size = output_size
-        # crop_factor 0.8 bedeutet: Wir behalten die mittleren 80% des Bildes
-        self.crop_factor = crop_factor
-        self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-
-    def __call__(self, img):
-        # PIL → numpy
-        img = np.array(img)
-
-        if img.dtype != np.uint8:
-            img = img.astype(np.uint8)
-
-        # 1. CLAHE (Kontrast verbessern, solange die Auflösung noch hoch ist)
-        img = self.clahe.apply(img)
-
-        # 2. NEU: CENTER CROP (Ränder abschneiden)
-        h, w = img.shape
-        crop_h = int(h * self.crop_factor)
-        crop_w = int(w * self.crop_factor)
-
-        # Startpunkte berechnen
-        start_y = (h - crop_h) // 2
-        start_x = (w - crop_w) // 2
-
-        # Zuschneiden
-        img = img[start_y:start_y + crop_h, start_x:start_x + crop_w]
-
-        # 3. Resize (WICHTIG: Interpolation beachten)
-        # cv2.INTER_AREA ist mathematisch besser beim Verkleinern (Downsampling)
-        # als der Standard (INTER_LINEAR), da es Aliasing vermeidet.
-        img = cv2.resize(img, (self.output_size, self.output_size), interpolation=cv2.INTER_AREA)
-
-        # zurück zu PIL
-        img = Image.fromarray(img)
-
-        return img
-
+# ======================================================
+# 2. HILFSKLASSEN
+# ======================================================
 
 class ImagePathDataset(Dataset):
-    """Einfaches Dataset für Mendeley-Daten"""
     def __init__(self, image_paths, labels, transform=None):
         self.image_paths = image_paths
         self.labels = labels
@@ -155,20 +31,23 @@ class ImagePathDataset(Dataset):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        img = Image.open(self.image_paths[idx]).convert('L')
-        if self.transform:
-            img = self.transform(img)
-        return img, self.labels[idx]
+        try:
+            img = Image.open(self.image_paths[idx]).convert('L')
+            if self.transform:
+                img = self.transform(img)
+            return img, self.labels[idx]
+        except Exception as e:
+            print(f"[ERROR] Fehler beim Laden von {self.image_paths[idx]}: {e}")
+            return None, self.labels[idx]
 
 
 def custom_collate_fn(batch):
-    batch = [(img, lbl) for img, lbl in batch if lbl is not None]
+    batch = [(img, lbl) for img, lbl in batch if img is not None]
     if len(batch) == 0:
         return None
     images, labels = zip(*batch)
     images = torch.stack(images)
 
-    # 🔧 Hier wird jedes Label auf einen Skalar reduziert
     clean_labels = []
     for lbl in labels:
         if isinstance(lbl, torch.Tensor):
@@ -177,121 +56,185 @@ def custom_collate_fn(batch):
             clean_labels.append(int(lbl[0]))
         else:
             clean_labels.append(int(lbl))
-    labels = torch.tensor(clean_labels, dtype=torch.long)
 
+    labels = torch.tensor(clean_labels, dtype=torch.long)
     return images, labels
 
 
-# === NEUE HILFSFUNKTION FÜR EXTERNEN DATENSATZ ===
-def create_external_loader(base_path, transform_test, custom_collate_fn, num_samples_per_class=1000, seed=42):
+# ======================================================
+# 3. SPLIT & SKEW LOGIK (MIT SIZING)
+# ======================================================
+
+def get_labels_from_dataset(dataset):
+    if isinstance(dataset, Subset):
+        parent_labels = get_labels_from_dataset(dataset.dataset)
+        return [parent_labels[i] for i in dataset.indices]
+
+    if hasattr(dataset, 'targets'):
+        return dataset.targets
+
+    if hasattr(dataset, 'labels'):
+        labels = dataset.labels
+        if len(labels) > 0 and isinstance(labels[0], (list, np.ndarray)):
+            return [int(l[0]) for l in labels]
+        return labels
+
+    labels = []
+    for i in range(len(dataset)):
+        _, lbl = dataset[i]
+        labels.append(int(lbl))
+    return labels
+
+
+def create_skewed_subset(dataset, majority_class, ratio=0.9, seed=42, target_size=None):
     """
-    Sammelt Bildpfade von PNEUMONIA/NORMAL, zieht eine zufällige Stichprobe
-    und erstellt den finalen DataLoader.
+    Erstellt ein Subset mit Skew und spezifischer Zielgröße (Upsampling/Downsampling).
     """
-    random.seed(seed)
+    labels = np.array(get_labels_from_dataset(dataset))
+    indices_maj = np.where(labels == majority_class)[0]
+    indices_min = np.where(labels != majority_class)[0]
 
-    pneumonia_path = os.path.join(base_path, 'PNEUMONIA')
-    normal_path = os.path.join(base_path, 'NORMAL')
+    if target_size is None:
+        target_size = len(dataset)
 
-    if not os.path.exists(pneumonia_path) or not os.path.exists(normal_path):
-        raise FileNotFoundError(f"Mindestens einer der externen Pfade existiert nicht: {base_path}")
+    n_maj_target = int(target_size * ratio)
+    n_min_target = target_size - n_maj_target
 
-    # 1. Pfade sammeln und Labels zuweisen (0=Normal, 1=Pneumonia)
-    # Annahme: Alle Bilder sind .png oder .jpeg
+    rng = np.random.default_rng(seed)
 
-    pneumonia_files = glob.glob(os.path.join(pneumonia_path, '*.*'))
-    normal_files = glob.glob(os.path.join(normal_path, '*.*'))
+    # Entscheidung ob Upsampling nötig ist (replace=True)
+    replace_maj = len(indices_maj) < n_maj_target
+    replace_min = len(indices_min) < n_min_target
 
-    print(f"[INFO] Externe Daten gefunden: PNEUMONIA={len(pneumonia_files)}, NORMAL={len(normal_files)}")
+    final_indices_maj = rng.choice(indices_maj, size=n_maj_target, replace=replace_maj)
+    final_indices_min = rng.choice(indices_min, size=n_min_target, replace=replace_min)
 
-    # 2. Zufällige Stichprobe ziehen
-    if len(pneumonia_files) >= num_samples_per_class:
-        pneu_subset = random.sample(pneumonia_files, num_samples_per_class)
-    else:
-        print(f"[WARNUNG] Nur {len(pneumonia_files)} PNEUMONIA-Bilder verfügbar. Alle werden verwendet.")
-        pneu_subset = pneumonia_files
+    final_indices = np.concatenate([final_indices_maj, final_indices_min])
+    rng.shuffle(final_indices)
 
-    if len(normal_files) >= num_samples_per_class:
-        normal_subset = random.sample(normal_files, num_samples_per_class)
-    else:
-        print(f"[WARNUNG] Nur {len(normal_files)} NORMAL-Bilder verfügbar. Alle werden verwendet.")
-        normal_subset = normal_files
-
-    # 3. Pfade und Labels zusammenfassen
-    image_paths = pneu_subset + normal_subset
-    labels = [1] * len(pneu_subset) + [0] * len(normal_subset)
-
-    # 4. Dataset und DataLoader erstellen
-    external_ds = ImagePathDataset(image_paths, labels, transform=transform_test)
-
-    external_loader = DataLoader(
-        external_ds,
-        batch_size=64,
-        shuffle=False,  # Kein Mischen für Test- oder Evaluations-Loader
-        collate_fn=custom_collate_fn
-    )
-
-    print(
-        f"[INFO] External Test Loader erstellt mit {len(external_ds)} Bildern (Target 0: {len(normal_subset)}, Target 1: {len(pneu_subset)})")
-
-    return external_loader
+    return Subset(dataset, final_indices)
 
 
-# NEUE, KORRIGIERTE SIGNATUR
-def split_client_dataset(base_name, base_dataset, all_client_fractions, custom_collate_fn, seed=42):
-    """
-    Teilt ein Dataset in vier disjunkte Subclients auf, basierend auf all_client_fractions[base_name].
-    """
-    np.random.seed(seed)
-    total_len = len(base_dataset)
-    # HIER WIRD AUS DEM GESAMTEN DICTIONARY die FRACTION GEHOLT:
-    fraction = all_client_fractions.get(base_name, 0.1)
-    used_len = int(total_len * fraction)
+def stratified_split(dataset, fractions, seed=42):
+    labels = np.array(get_labels_from_dataset(dataset))
+    unique_labels = np.unique(labels)
 
-    indices = np.random.choice(total_len, used_len, replace=False)
-    subset = Subset(base_dataset, indices)
+    indices_per_class = {label: np.where(labels == label)[0] for label in unique_labels}
+    split_indices = [[] for _ in range(len(fractions))]
+    rng = np.random.default_rng(seed)
 
-    sub_len = used_len // 4
-    sub_lengths = [sub_len] * 4
-    sub_lengths[-1] += used_len - sum(sub_lengths)
+    for label, indices in indices_per_class.items():
+        rng.shuffle(indices)
+        n_class = len(indices)
+        counts = [int(f * n_class) for f in fractions]
 
-    # Korrektur der Aufteilung, um 80/10/10 zu nutzen (basierend auf Ihrer letzten Anfrage)
-    sub_datasets = random_split(subset, sub_lengths, generator=torch.Generator().manual_seed(seed))
+        diff = n_class - sum(counts)
+        counts[0] += diff
+
+        current = 0
+        for i, count in enumerate(counts):
+            split_indices[i].extend(indices[current: current + count])
+            current += count
+
+    for indices in split_indices:
+        rng.shuffle(indices)
+
+    return [Subset(dataset, indices) for indices in split_indices]
+
+
+def split_client_dataset(base_name, base_dataset, all_client_fractions, custom_collate_fn, seed=42,
+                         has_external_test=False):
+    # --- Schritt 1: Aufteilung in 4 Subclients ---
+    sub_fractions = [0.25, 0.25, 0.25, 0.25]
+
+    fraction_total = all_client_fractions.get(base_name, 1.0)
+    if fraction_total < 1.0:
+        base_dataset, _ = stratified_split(base_dataset, [fraction_total, 1 - fraction_total], seed=seed)
+
+    sub_datasets = stratified_split(base_dataset, sub_fractions, seed=seed)
 
     loaders = {}
     for i, sub_ds in enumerate(sub_datasets, 1):
-        # ANGEPASSTE SPLIT-VERTEILUNG: 80% / 10% / 10%
-        n_train = int(0.80 * len(sub_ds))
-        n_val = int(0.10 * len(sub_ds))
-        n_test = len(sub_ds) - n_train - n_val
-
-        train_ds, val_ds, test_ds = random_split(sub_ds, [n_train, n_val, n_test],
-                                                 generator=torch.Generator().manual_seed(seed + i))
         cid = f"{base_name}_sub{i}"
+
+        # --- Schritt 2: Interner Split (Train/Val) ---
+        if has_external_test:
+            train_ds, val_ds = stratified_split(sub_ds, [0.9, 0.1], seed=seed + i)
+            test_ds = None
+        else:
+            train_ds, val_ds, test_ds = stratified_split(sub_ds, [0.8, 0.1, 0.1], seed=seed + i)
+
+        # --- MANIPULATIONEN (SKEW & SIZING) ---
+
+        # Fall A: LDS Clients (Starker Skew, kleinere Größe)
+        if cid == 'client_2_sub1':
+            print(f"️ [LDS] {cid}: 90% NORMAL, Size ~550")
+            train_ds = create_skewed_subset(train_ds, majority_class=0, ratio=0.9, seed=seed, target_size=550)
+            val_ds = create_skewed_subset(val_ds, majority_class=0, ratio=0.9, seed=seed, target_size=70)
+
+        elif cid == 'client_3_sub1':
+            print(f" [LDS] {cid}: 90% PNEUMONIE, Size ~550")
+            train_ds = create_skewed_subset(train_ds, majority_class=1, ratio=0.9, seed=seed, target_size=550)
+            val_ds = create_skewed_subset(val_ds, majority_class=1, ratio=0.9, seed=seed, target_size=70)
+
+        # Fall B: Normale Clients (Kein Skew, aber Downsampling auf 1000)
+        else:
+            # Wir wollen ca. 1000 Trainingsbilder.
+            # Aktuell sind es ca. 1170-1180.
+            target_train = 1000
+            if len(train_ds) > target_train:
+                frac = target_train / len(train_ds)
+                # Wir behalten 'frac', den Rest verwerfen wir (_)
+                train_ds, _ = stratified_split(train_ds, [frac, 1 - frac], seed=seed)
+
+            # Validation proportional anpassen? Oder lassen?
+            # Lassen wir bei ~130, das ist eine gute Größe für stabile Validation.
+            # (Wenn du es strikt proportional willst: target_val = 125, aber der Unterschied ist marginal)
+
         loaders[cid] = {
-            # custom_collate_fn ist jetzt definiert
             "train": DataLoader(train_ds, batch_size=32, shuffle=True, collate_fn=custom_collate_fn),
             "val": DataLoader(val_ds, batch_size=64, shuffle=False, collate_fn=custom_collate_fn),
-            "test": DataLoader(test_ds, batch_size=64, shuffle=False, collate_fn=custom_collate_fn),
+            "test": DataLoader(test_ds, batch_size=64, shuffle=False, collate_fn=custom_collate_fn) if test_ds else None
         }
     return loaders
 
 
-# === HAUPTFUNKTION ===
+# ======================================================
+# 4. HAUPTFUNKTION: LOAD CLIENT DATA
+# ======================================================
+
+def create_external_loader(base_path, transform_test, custom_collate_fn, num_samples_per_class=1000, seed=42):
+    random.seed(seed)
+    pneumonia_path = os.path.join(base_path, 'PNEUMONIA')
+    normal_path = os.path.join(base_path, 'NORMAL')
+
+    if not os.path.exists(pneumonia_path) or not os.path.exists(normal_path):
+        raise FileNotFoundError(f"Externe Pfade nicht gefunden in: {base_path}")
+
+    pneumonia_files = glob.glob(os.path.join(pneumonia_path, '*.*'))
+    normal_files = glob.glob(os.path.join(normal_path, '*.*'))
+
+    pneu_subset = random.sample(pneumonia_files, min(len(pneumonia_files), num_samples_per_class))
+    normal_subset = random.sample(normal_files, min(len(normal_files), num_samples_per_class))
+
+    image_paths = pneu_subset + normal_subset
+    labels = [1] * len(pneu_subset) + [0] * len(normal_subset)
+
+    external_ds = ImagePathDataset(image_paths, labels, transform=transform_test)
+    print(
+        f"[INFO] External Test Loader: {len(external_ds)} Bilder (Normal: {len(normal_subset)}, Pneu: {len(pneu_subset)})")
+
+    return DataLoader(external_ds, batch_size=64, shuffle=False, collate_fn=custom_collate_fn)
+
+
 def load_client_data(client_qubits, custom_collate_fn, client_fractions=None, seed=42):
-    """
-    Lädt Daten für alle Clients und Subclients.
-    - MedMNIST -> client_1
-    - RSNA -> client_2, client_3
-    - Kaggle -> client_4
-    - Subclients erhalten disjunkte Datensätze nach client_fractions
-    """
     np.random.seed(seed)
     torch.manual_seed(seed)
     random.seed(seed)
 
     client_train_loaders, client_val_loaders, client_test_loaders = {}, {}, {}
 
+    # --- TRANSFORMS ---
     common_transform_train = transforms.Compose([
         transforms.Grayscale(num_output_channels=1),
         transforms.Resize((32, 32)),
@@ -306,169 +249,115 @@ def load_client_data(client_qubits, custom_collate_fn, client_fractions=None, se
         transforms.Normalize(mean=[0.5], std=[0.5])
     ])
 
-    rsna_preprocess = RSNAPreprocessingTransform(output_size=32)
-
-    rsna_transform_train = transforms.Compose([
-        rsna_preprocess,
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5], std=[0.5])
-    ])
-
-
-    # ===== CLIENT 1: MedMNIST =====
+    # ==========================================
+    # 1. CLIENT 1: MedMNIST
+    # ==========================================
     if any(k.startswith('client_1') for k in client_qubits):
+        print("\n[LOAD] Lade MedMNIST für Client 1...")
+        from medmnist import PneumoniaMNIST
+
         train_ds_full = PneumoniaMNIST(split='train', transform=common_transform_train, download=True)
         val_ds_full = PneumoniaMNIST(split='val', transform=common_transform_test, download=True)
         test_ds_full = PneumoniaMNIST(split='test', transform=common_transform_test, download=True)
 
         subclients = [c for c in client_qubits if c.startswith('client_1')]
         num_subclients = len(subclients)
+        fracs = [1.0 / num_subclients] * num_subclients
 
-        def disjunctive_split_to_loaders(base_dataset, is_train_set=False):
-            total_len = len(base_dataset)
-            sub_len = total_len // num_subclients
-            sub_lengths = [sub_len] * num_subclients
-            sub_lengths[-1] += total_len - sum(sub_lengths)
-
-            sub_datasets = random_split(base_dataset, sub_lengths,
-                                        generator=torch.Generator().manual_seed(seed))
-
-            loaders_dict = {}
-            batch_size = 32 if is_train_set else 64
-
-            for i, sub_ds in enumerate(sub_datasets):
-                cid = f"{base_name}_sub{i + 1}"
-                if cid in client_qubits:
-                    loaders_dict[cid] = DataLoader(sub_ds,
-                                                   batch_size=batch_size,
-                                                   shuffle=is_train_set,
-                                                   collate_fn=custom_collate_fn)
-            return loaders_dict
-
-        base_name = 'client_1'
-        train_loaders_split = disjunctive_split_to_loaders(train_ds_full, is_train_set=True)
-        val_loaders_split = disjunctive_split_to_loaders(val_ds_full, is_train_set=False)
-        test_loaders_split = disjunctive_split_to_loaders(test_ds_full, is_train_set=False)
-
-        for cid in subclients:
-            if cid in client_qubits:
-                client_train_loaders[cid] = train_loaders_split[cid]
-                client_val_loaders[cid] = val_loaders_split[cid]
-                client_test_loaders[cid] = test_loaders_split[cid]
-
-                n_train = len(client_train_loaders[cid].dataset)
-                n_val = len(client_val_loaders[cid].dataset)
-                n_test = len(client_test_loaders[cid].dataset)
-
-                # --- Labelverarbeitung robust ---
-                train_subset = client_train_loaders[cid].dataset
-                labels_sub = np.array([int(train_ds_full.labels[i]) for i in train_subset.indices], dtype=int)
-
-                print(f"[INFO] {cid}: Train={n_train}, Val={n_val}, Test={n_test} | Class dist={np.bincount(labels_sub)}")
-
-    # ===== CLIENT 2 & 3: RSNA =====
-    if any(k.startswith('client_2') or k.startswith('client_3') for k in client_qubits):
-        rsna_images = os.path.join(RSNA_BASE_PATH, 'Training', 'Images')
-        # Das ist die Datei aus deinem Screenshot, die schon alles enthält:
-        rsna_csv = os.path.join(RSNA_BASE_PATH, 'stage2_train_metadata.csv')
-
-        rsna_full = RSNADataset(
-            images_dir=rsna_images,
-            metadata_csv=rsna_csv,
-            # KEIN class_info_csv mehr nötig!
-            transform=rsna_transform_train
-        )
-
-        total_per_base = 5000
-        labels = np.array(rsna_full.labels)
-        idx0, idx1 = np.where(labels == 0)[0], np.where(labels == 1)[0]
-        np.random.shuffle(idx0)
-        np.random.shuffle(idx1)
-
-        client2_idx = np.concatenate([idx0[:total_per_base // 2], idx1[:total_per_base // 2]])
-        client3_idx = np.concatenate([idx0[total_per_base // 2:total_per_base], idx1[total_per_base // 2:total_per_base]])
-
-        base_dict = {'client_2': client2_idx, 'client_3': client3_idx}
-
-        for base_client, base_idx in base_dict.items():
-            sub_split = split_client_dataset(
-                base_client,
-                Subset(rsna_full, base_idx),
-                client_fractions,
-                custom_collate_fn,
-                seed
-            )
-
-            for sub_id, loaders_dict in sub_split.items():
-                client_train_loaders[sub_id] = loaders_dict["train"]
-                client_val_loaders[sub_id] = loaders_dict["val"]
-                client_test_loaders[sub_id] = loaders_dict["test"]
-
-                train_subset = client_train_loaders[sub_id].dataset
-                train_indices = train_subset.indices
-                labels_sub = np.array([int(rsna_full[i][1]) for i in train_indices], dtype=int)
-
-                n_train = len(loaders_dict["train"].dataset)
-                n_val = len(loaders_dict["val"].dataset)
-                n_test = len(loaders_dict["test"].dataset)
-
-                print(f"[INFO] {sub_id}: Train={n_train}, Val={n_val}, Test={n_test} | Class dist={np.bincount(labels_sub)}")
-
-    # ===== CLIENT 4: Kaggle =====
-    if any(k.startswith('client_4') for k in client_qubits):
-        train_path = os.path.join(Pneumonia_Datasets_PATH, "train_data/client_4/train")
-        test_path = os.path.join(Pneumonia_Datasets_PATH, "test_data/client_4/test")
-        train_full = datasets.ImageFolder(root=train_path, transform=common_transform_train)
-        test_full = datasets.ImageFolder(root=test_path, transform=common_transform_test)
-
-        total_len_train = len(train_full)
-        train_indices = np.arange(total_len_train)
-        np.random.shuffle(train_indices)
-        shuffled_train_full = Subset(train_full, train_indices)
-
-        sub_split = split_client_dataset(
-            'client_4',
-            shuffled_train_full,
-            client_fractions,
-            custom_collate_fn,
-            seed
-        )
-
-
-        subclients = [c for c in client_qubits if c.startswith("client_4")]
-        num_subclients = len(subclients)
-
-        # split test set into num_subclients parts
-        test_indices = np.arange(len(test_full))
-        np.random.shuffle(test_indices)
-        test_split = np.array_split(test_indices, num_subclients)
+        train_subs = stratified_split(train_ds_full, fracs, seed=seed)
+        val_subs = stratified_split(val_ds_full, fracs, seed=seed)
+        test_subs = stratified_split(test_ds_full, fracs, seed=seed)
 
         for i, cid in enumerate(subclients):
+            # HIER: Auch MedMNIST Subclients auf 1000 reduzieren?
+            # Aktuell haben sie ~1180. Wir reduzieren sie auch, um Fair zu bleiben.
 
-            # TRAIN-LOADER werden bei dir bereits über split_client_dataset erzeugt
-            client_train_loaders[cid] = sub_split[cid]["train"]
-            client_val_loaders[cid] = sub_split[cid]["val"]
+            t_ds = train_subs[i]
+            target_train = 1000
+            if len(t_ds) > target_train:
+                frac = target_train / len(t_ds)
+                t_ds, _ = stratified_split(t_ds, [frac, 1 - frac], seed=seed + i)
 
-            # TEST-SET KORREKT ZUORDNEN
-            client_test_loaders[cid] = DataLoader(
-                Subset(test_full, test_split[i]),
-                batch_size=64,
-                shuffle=False,
-                collate_fn=custom_collate_fn
-            )
+            client_train_loaders[cid] = DataLoader(t_ds, batch_size=32, shuffle=True, collate_fn=custom_collate_fn)
+            client_val_loaders[cid] = DataLoader(val_subs[i], batch_size=64, shuffle=False,
+                                                 collate_fn=custom_collate_fn)
+            client_test_loaders[cid] = DataLoader(test_subs[i], batch_size=64, shuffle=False,
+                                                  collate_fn=custom_collate_fn)
+            print(f"[INFO] {cid}: Train={len(client_train_loaders[cid].dataset)}")
 
-            train_subset = client_train_loaders[cid].dataset
-            original_indices = [train_indices[i] for i in train_subset.indices]
-            labels_sub = np.array([int(train_full.targets[i]) for i in original_indices], dtype=int)
+    # ==========================================
+    # 2. CLIENT 2 & 3: Folder-Struktur
+    # ==========================================
+    folder_clients = ['client_2', 'client_3']
 
-            n_train = len(client_train_loaders[cid].dataset)
-            n_val = len(client_val_loaders[cid].dataset)
-            n_test = len(client_test_loaders[cid].dataset)
+    for base_client in folder_clients:
+        subclients = [c for c in client_qubits if c.startswith(base_client)]
+        if not subclients: continue
 
-            print(f"[INFO] {cid}: Train={n_train}, Val={n_val}, Test={n_test} | Class dist={np.bincount(labels_sub)}")
+        print(f"\n[LOAD] Lade Daten für {base_client}...")
+        train_path = os.path.join(Pneumonia_Datasets_PATH, "train_data", base_client, "train")
+        test_path = os.path.join(Pneumonia_Datasets_PATH, "test_data", base_client, "test")
 
-    # ===== EXTERNE DATEN =====
+        if not os.path.exists(train_path):
+            print(f"[WARNUNG] Trainingspfad nicht gefunden: {train_path}. Überspringe.")
+            continue
+
+        train_full = datasets.ImageFolder(root=train_path, transform=common_transform_train)
+
+        has_external_test = False
+        test_full = None
+
+        if os.path.exists(test_path) and len(glob.glob(os.path.join(test_path, "*"))) > 0:
+            try:
+                test_full = datasets.ImageFolder(root=test_path, transform=common_transform_test)
+                has_external_test = True
+                print(f"[INFO] {base_client}: Externer Test-Ordner gefunden ({len(test_full)} Bilder).")
+            except:
+                print(f"[WARNUNG] Fehler beim Laden von Test-Daten für {base_client}. Nutze Split.")
+        else:
+            print(f"[INFO] {base_client}: Kein externer Test-Ordner. Erstelle Test-Split aus Training.")
+
+        # Ruft split_client_dataset auf (enthält SKEW & SIZING Logik für Train/Val)
+        loaders_split = split_client_dataset(
+            base_client,
+            train_full,
+            client_fractions if client_fractions else {},
+            custom_collate_fn,
+            seed,
+            has_external_test=has_external_test
+        )
+
+        test_subsets_base = []
+        if has_external_test and test_full:
+            num_subs = 4
+            t_fracs = [1.0 / num_subs] * num_subs
+            test_subsets_base = stratified_split(test_full, t_fracs, seed=seed)
+
+        for i, cid in enumerate(subclients):
+            if cid in loaders_split:
+                client_train_loaders[cid] = loaders_split[cid]["train"]
+                client_val_loaders[cid] = loaders_split[cid]["val"]
+
+                if has_external_test:
+                    if i < len(test_subsets_base):
+                        client_test_loaders[cid] = DataLoader(test_subsets_base[i], batch_size=64, shuffle=False,
+                                                              collate_fn=custom_collate_fn)
+                    else:
+                        print(f"[WARNUNG] Kein Test-Split mehr für {cid}.")
+                else:
+                    client_test_loaders[cid] = loaders_split[cid]["test"]
+
+                # Quick Stat Check
+                try:
+                    labels_t = get_labels_from_dataset(client_train_loaders[cid].dataset)
+                    dist_t = dict(Counter(labels_t))
+                    ratio_t = dist_t.get(1, 0) / (dist_t.get(0, 1) + 1e-6)
+                    print(f"[INFO] {cid}: Train={len(labels_t)} (Pneu/Norm Ratio: {ratio_t:.2f})")
+                except:
+                    print(f"[INFO] {cid}: Train={len(client_train_loaders[cid].dataset)}")
+
     try:
+        print("\n[LOAD] Lade externe Mendeley Daten...")
         external_loader = create_external_loader(
             base_path=EXTERNAL_DATA_PATH,
             transform_test=common_transform_test,
@@ -476,7 +365,7 @@ def load_client_data(client_qubits, custom_collate_fn, client_fractions=None, se
             num_samples_per_class=1000,
             seed=seed
         )
-    except FileNotFoundError as e:
+    except Exception as e:
         print(f"[FEHLER] Externe Daten konnten nicht geladen werden: {e}")
         external_loader = None
 
