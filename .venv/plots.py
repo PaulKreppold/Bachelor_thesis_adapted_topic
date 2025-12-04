@@ -875,99 +875,153 @@ def plot_skew_severity_analysis(qfl_client_metrics, baseline_client_metrics,
                                 client_train_loaders, seeds):
     """
     Korrelation: Je stärker der Skew, desto mehr profitiert man von QFL?
+    VERWENDET MINORITY CLASS F1 (nicht generellen F1!)
     """
     data = []
-
+    
     for cid, loader in client_train_loaders.items():
         labels = get_labels_from_dataset(loader.dataset)
         counts = Counter(labels)
         minority_ratio = min(counts.values()) / len(labels)
-
+        minority_class = get_minority_class(loader)  # 0 oder 1
+        
         # Skew Severity = Abweichung von 50%
         skew_severity = abs(0.5 - minority_ratio)
-
+        
         for seed in seeds:
+            # WICHTIG: Verwende Minority Class F1, nicht generellen F1!
+            qfl_minority_f1 = qfl_client_metrics[seed][cid].get(f'f1_class_{minority_class}', np.nan)
+            base_minority_f1 = baseline_client_metrics[seed][cid].get(f'f1_class_{minority_class}', np.nan)
+            
+            # Genereller F1 für Vergleich
             qfl_f1 = qfl_client_metrics[seed][cid]['f1']
             base_f1 = baseline_client_metrics[seed][cid]['f1']
-
-            data.append({
-                'Client': cid,
-                'Seed': seed,
-                'Minority_Ratio': minority_ratio,
-                'Skew_Severity': skew_severity,
-                'F1_Gain': qfl_f1 - base_f1,
-                'QFL_F1': qfl_f1,
-                'Baseline_F1': base_f1
-            })
-
+            
+            if not np.isnan(qfl_minority_f1) and not np.isnan(base_minority_f1):
+                data.append({
+                    'Client': cid,
+                    'Seed': seed,
+                    'Minority_Ratio': minority_ratio,
+                    'Minority_Class': minority_class,
+                    'Skew_Severity': skew_severity,
+                    'F1_Gain_Minority': qfl_minority_f1 - base_minority_f1,  # HAUPTMETRIK
+                    'F1_Gain_Overall': qfl_f1 - base_f1,  # Zum Vergleich
+                    'QFL_Minority_F1': qfl_minority_f1,
+                    'Baseline_Minority_F1': base_minority_f1,
+                    'QFL_Overall_F1': qfl_f1,
+                    'Baseline_Overall_F1': base_f1
+                })
+    
     df = pd.DataFrame(data)
-
-    # Correlation
-    corr, p_value = spearmanr(df['Skew_Severity'], df['F1_Gain'])
-
+    
+    if len(df) == 0:
+        print("⚠️ No data available for skew severity analysis")
+        return df
+    
+    # Correlations
+    corr_minority, p_minority = spearmanr(df['Skew_Severity'], df['F1_Gain_Minority'])
+    corr_overall, p_overall = spearmanr(df['Skew_Severity'], df['F1_Gain_Overall'])
+    
     # Plotting
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-
-    # Plot 1: Scatter with Regression
+    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
+    
+    # Plot 1: Scatter - Minority F1 Gain
     ax1 = axes[0]
     for seed in seeds:
         subset = df[df['Seed'] == seed]
-        ax1.scatter(subset['Skew_Severity'], subset['F1_Gain'],
-                    alpha=0.6, s=100, label=f'Seed {seed}')
-
+        ax1.scatter(subset['Skew_Severity'], subset['F1_Gain_Minority'], 
+                   alpha=0.6, s=100, label=f'Seed {seed}')
+    
     # Regression Line
-    z = np.polyfit(df['Skew_Severity'], df['F1_Gain'], 1)
+    z = np.polyfit(df['Skew_Severity'], df['F1_Gain_Minority'], 1)
     p = np.poly1d(z)
     x_line = np.linspace(df['Skew_Severity'].min(), df['Skew_Severity'].max(), 100)
-    ax1.plot(x_line, p(x_line), 'r--', linewidth=2, label=f'Trend (ρ={corr:.3f})')
-
+    ax1.plot(x_line, p(x_line), 'r--', linewidth=2.5, label=f'Trend (ρ={corr_minority:.3f})')
+    
     ax1.axhline(0, color='black', linestyle='-', linewidth=1, alpha=0.5)
     ax1.set_xlabel('Skew Severity (|0.5 - Minority Ratio|)', fontsize=12)
-    ax1.set_ylabel('F1 Improvement (QFL - Baseline)', fontsize=12)
-    ax1.set_title(f'Skew Severity vs. F1 Gain\n(Spearman ρ={corr:.3f}, p={p_value:.4f})',
-                  fontweight='bold', fontsize=14)
+    ax1.set_ylabel('Minority Class F1 Improvement', fontsize=12)
+    ax1.set_title(f'Skew Severity vs. Minority F1 Gain\n(Spearman ρ={corr_minority:.3f}, p={p_minority:.4f})', 
+                 fontweight='bold', fontsize=14)
     ax1.legend()
     ax1.grid(True, linestyle='--', alpha=0.3)
-
-    # Plot 2: Binned Analysis
+    
+    # Plot 2: Comparison - Minority vs. Overall F1 Gain
     ax2 = axes[1]
-    df['Skew_Bin'] = pd.cut(df['Skew_Severity'],
-                            bins=[0, 0.1, 0.2, 0.3, 0.5],
-                            labels=['Mild (<10%)', 'Moderate (10-20%)',
-                                    'Severe (20-30%)', 'Extreme (>30%)'])
-
-    sns.boxplot(data=df, x='Skew_Bin', y='F1_Gain', ax=ax2, palette='RdYlGn_r')
-    ax2.axhline(0, color='red', linestyle='--', linewidth=1.5)
-    ax2.set_xlabel('Skew Severity Category', fontsize=12)
+    df_melted = df.melt(id_vars=['Skew_Severity'], 
+                        value_vars=['F1_Gain_Minority', 'F1_Gain_Overall'],
+                        var_name='Metric', value_name='F1_Gain')
+    
+    for metric in ['F1_Gain_Minority', 'F1_Gain_Overall']:
+        subset = df_melted[df_melted['Metric'] == metric]
+        label = 'Minority F1' if metric == 'F1_Gain_Minority' else 'Overall F1'
+        color = 'red' if metric == 'F1_Gain_Minority' else 'blue'
+        ax2.scatter(subset['Skew_Severity'], subset['F1_Gain'], 
+                   alpha=0.5, s=80, label=label, color=color)
+        
+        # Trendline
+        z = np.polyfit(subset['Skew_Severity'], subset['F1_Gain'], 1)
+        p_trend = np.poly1d(z)
+        ax2.plot(x_line, p_trend(x_line), linestyle='--', linewidth=2, color=color)
+    
+    ax2.axhline(0, color='black', linestyle='-', linewidth=1)
+    ax2.set_xlabel('Skew Severity', fontsize=12)
     ax2.set_ylabel('F1 Improvement', fontsize=12)
-    ax2.set_title('F1 Gain by Skew Severity', fontweight='bold', fontsize=14)
-    ax2.grid(True, linestyle='--', alpha=0.3, axis='y')
-
+    ax2.set_title('Minority vs. Overall F1 Improvement', fontweight='bold', fontsize=14)
+    ax2.legend()
+    ax2.grid(True, linestyle='--', alpha=0.3)
+    
+    # Plot 3: Binned Analysis - Minority F1
+    ax3 = axes[2]
+    df['Skew_Bin'] = pd.cut(df['Skew_Severity'], 
+                            bins=[0, 0.1, 0.2, 0.3, 0.5],
+                            labels=['Mild (<10%)', 'Moderate (10-20%)', 
+                                   'Severe (20-30%)', 'Extreme (>30%)'])
+    
+    sns.boxplot(data=df, x='Skew_Bin', y='F1_Gain_Minority', ax=ax3, palette='RdYlGn_r')
+    ax3.axhline(0, color='red', linestyle='--', linewidth=1.5)
+    ax3.set_xlabel('Skew Severity Category', fontsize=12)
+    ax3.set_ylabel('Minority F1 Improvement', fontsize=12)
+    ax3.set_title('Minority F1 Gain by Skew Severity', fontweight='bold', fontsize=14)
+    ax3.grid(True, linestyle='--', alpha=0.3, axis='y')
+    
     plt.tight_layout()
     plt.show()
-
-    # Analysis
-    print("\n" + "=" * 80)
+    
+    # Analysis Output
+    print("\n" + "="*80)
     print("📊 SKEW SEVERITY vs. IMPROVEMENT ANALYSIS")
-    print("=" * 80)
-    print(f"\nSpearman Correlation: ρ = {corr:.4f}, p = {p_value:.4f}")
-
-    if p_value < 0.05:
-        if corr > 0:
-            print("✓ POSITIVE correlation: Stronger skew → MORE benefit from QFL")
+    print("="*80)
+    
+    print(f"\nMINORITY CLASS F1:")
+    print(f"  Spearman ρ = {corr_minority:.4f}, p = {p_minority:.4f}")
+    if p_minority < 0.05:
+        if corr_minority > 0:
+            print("  ✓ POSITIVE correlation: Stronger skew → MORE minority class benefit from QFL")
         else:
-            print("✓ NEGATIVE correlation: Stronger skew → LESS benefit (unexpected)")
+            print("  ✓ NEGATIVE correlation: Stronger skew → LESS minority class benefit")
     else:
-        print("✗ No significant correlation between skew severity and QFL benefit")
-
-    print("\nF1 Gain by Severity:")
+        print("  ✗ No significant correlation")
+    
+    print(f"\nOVERALL F1 (for comparison):")
+    print(f"  Spearman ρ = {corr_overall:.4f}, p = {p_overall:.4f}")
+    if p_overall < 0.05:
+        print(f"  ✓ Significant correlation")
+    else:
+        print("  ✗ No significant correlation")
+    
+    print("\nMinority F1 Gain by Severity:")
     for bin_name in df['Skew_Bin'].cat.categories:
         subset = df[df['Skew_Bin'] == bin_name]
         if len(subset) > 0:
-            print(f"  {bin_name}: {subset['F1_Gain'].mean():.4f} ± {subset['F1_Gain'].std():.4f}")
-
-    print("=" * 80 + "\n")
-
+            minority_gain = subset['F1_Gain_Minority'].mean()
+            overall_gain = subset['F1_Gain_Overall'].mean()
+            print(f"  {bin_name}:")
+            print(f"    Minority F1 Gain: {minority_gain:+.4f} ± {subset['F1_Gain_Minority'].std():.4f}")
+            print(f"    Overall F1 Gain:  {overall_gain:+.4f} ± {subset['F1_Gain_Overall'].std():.4f}")
+    
+    print("="*80 + "\n")
+    
     return df
 
 
