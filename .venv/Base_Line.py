@@ -1,5 +1,6 @@
-import pennylane as qml
 import torch
+import pennylane as qml
+import numpy as np
 import torch.nn as nn
 
 
@@ -10,38 +11,47 @@ class QuantumModel(nn.Module):
         self.num_layers = num_layers
         self.dev = qml.device("default.qubit", wires=num_qubits)
 
-        # KORREKTUR 1: Weight Shapes anpassen
-        # BasicEntanglerLayers braucht nur 1 Parameter pro Qubit pro Layer
-        # Shape: (num_layers, num_qubits)
-        self.weight_shapes = {"params": (self.num_layers, self.num_qubits)}
+        # Parameter für VQC
+        self.weight_shapes = {"weights": (self.num_layers, self.num_qubits, 3)}
 
         self.qnode = self.create_qnode()
-        self.quantum_layer = qml.qnn.TorchLayer(self.qnode, self.weight_shapes,
-                                                init_method=lambda w: torch.nn.init.normal_(w, mean=0.0, std=0.05))
+
+        # Quanten Layer init über vollen Raum [0, 2π])
+        self.quantum_layer = qml.qnn.TorchLayer(
+            self.qnode,
+            self.weight_shapes,
+            init_method=lambda w: torch.nn.init.uniform_(w, 0, 2 * np.pi)
+        )
 
     def create_qnode(self):
         @qml.qnode(self.dev, interface="torch")
-        def circuit(inputs, params):
-            qml.templates.AmplitudeEmbedding(inputs, wires=range(self.num_qubits), normalize=True, pad_with=0.0)
+        def circuit(inputs, weights):
+            qml.AmplitudeEmbedding(
+                features=inputs,
+                wires=range(self.num_qubits),
+                normalize=True
+            )
 
-            # KORREKTUR 2: qml.RY statt 'Y' übergeben
-            qml.templates.BasicEntanglerLayers(params, wires=range(self.num_qubits), rotation=qml.RY)
+            qml.StronglyEntanglingLayers(
+                weights=weights,
+                wires=range(self.num_qubits)
+            )
 
-            return qml.expval(qml.PauliZ(0))
+            return [qml.expval(qml.PauliZ(i)) for i in range(self.num_qubits)]
 
         return circuit
 
-    def forward(self, inputs):
-        # inputs shape: [batch, 28, 28] -> muss flach sein
-        if inputs.dim() > 2:
-            inputs = inputs.view(inputs.size(0), -1)
+    def forward(self, x):
+        if x.dim() > 2:
+            x = x.reshape(x.size(0), -1)
 
-        exp_val = self.quantum_layer(inputs)
+        # Quantum Layer: Outputs in [-1, +1] (batch, num_qubits)
+        out = self.quantum_layer(x)
 
-        # Umrechnung von Erwartungswert [-1, 1] in Wahrscheinlichkeit [0, 1]
-        # exp_val = +1 (|0>) -> prob = 0
-        # exp_val = -1 (|1>) -> prob = 1
-        prob = (1 - exp_val) / 2
+        # Mean über alle Qubits: (batch, 1)
+        out = out.mean(dim=1, keepdim=True)
 
-        # Sicherstellen, dass die Dimension [batch, 1] ist für BCELoss
-        return prob.unsqueeze(1).float()
+        # Sigmoid anwenden: [-1, +1] → [0, 1] Wahrscheinlichkeiten
+        out = torch.sigmoid(out)
+
+        return out

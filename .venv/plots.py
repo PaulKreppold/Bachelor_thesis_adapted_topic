@@ -220,55 +220,98 @@ def plot_global_boxplot(qfl_client_results, baseline_client_results, clients, ce
 
 def plot_minority_f1_boxplots(qfl_client_results, baseline_client_results,
                               clients, client_train_loaders):
-    sort_key = lambda cid: (cid.split("_sub")[0], int(cid.split("_sub")[1]))
-    try:
-        clients_sorted = sorted(clients, key=sort_key)
-    except:
-        clients_sorted = sorted(clients)
+    """
+    Erstellt pro Base-Client (z.B. client_1) einen eigenen Plot,
+    der die Boxplots aller zugehörigen Sub-Clients (sub1 bis sub4) enthält.
+    """
 
-    num_clients = len(clients_sorted)
-    nrows = int(np.ceil(num_clients / 2))
-    ncols = 2 if num_clients > 1 else 1
+    # 1. Gruppieren der Clients nach ihrem Base-Client (String Parsing)
+    client_groups = {}
+    for cid in clients:
+        # Extrahiert "client_1" aus "client_1_sub1"
+        base_name = cid.split("_sub")[0]
+        if base_name not in client_groups:
+            client_groups[base_name] = []
+        client_groups[base_name].append(cid)
 
-    fig, axes = plt.subplots(nrows, ncols, figsize=(12, 4 * nrows))
-    axes = np.array(axes).flatten() if num_clients > 1 else [axes]
+    # Sortieren der Base-Clients (damit client_1 vor client_2 kommt)
+    sorted_base_clients = sorted(client_groups.keys())
 
-    all_vals_global = []
+    # 2. Iteration über jeden Base-Client -> Erzeugt jeweils EINEN Plot
+    for base_client in sorted_base_clients:
 
-    for idx, cid in enumerate(clients_sorted):
-        ax = axes[idx]
-        mcls = get_minority_class(client_train_loaders[cid])
-        key = f"f1_class_{mcls}"
+        # Die Sub-Clients für diesen Base-Client holen und sortieren (sub1, sub2...)
+        sub_clients = client_groups[base_client]
+        try:
+            # Sortierschlüssel: sub-Nummer
+            sub_clients.sort(key=lambda x: int(x.split("_sub")[1]))
+        except:
+            sub_clients.sort()
 
-        vq = [qfl_client_results[s][cid].get(key, np.nan) for s in qfl_client_results]
-        vb = [baseline_client_results[s][cid].get(key, np.nan) for s in baseline_client_results]
+        num_subs = len(sub_clients)
 
-        vq = [x for x in vq if not np.isnan(x)]
-        vb = [x for x in vb if not np.isnan(x)]
-        all_vals_global.extend(vq + vb)
+        # Dynamisches Layout: Meistens 2x2 bei 4 Subclients
+        if num_subs <= 4:
+            nrows, ncols = 2, 2
+            figsize = (12, 10)
+        else:
+            # Falls mal mehr als 4 Subs da sind -> dynamisch anpassen
+            ncols = 3
+            nrows = int(np.ceil(num_subs / ncols))
+            figsize = (15, 5 * nrows)
 
-        if len(vq) == 0 and len(vb) == 0:
-            ax.text(0.5, 0.5, "No data", ha="center")
-            continue
+        fig, axes = plt.subplots(nrows, ncols, figsize=figsize)
+        # Flatten axes array für einfache Iteration, auch wenn nur 1 Plot
+        axes = np.array(axes).flatten()
 
-        styled_boxplot(ax, [vq, vb], ["QFL", "Baseline"])
+        vals_in_this_figure = []  # Um y-Achsen Limit für DIESEN Plot zu bestimmen
 
-        ratio = get_minority_ratio(client_train_loaders[cid])
-        ax.set_title(f"{cid}\n(Minority={mcls}, Ratio={ratio:.2f})")
-        ax.set_ylabel("Minority F1")
-        ax.yaxis.grid(True, linestyle='--', alpha=0.5)
+        # 3. Plotten der Sub-Clients
+        for idx, cid in enumerate(sub_clients):
+            if idx >= len(axes): break  # Safety break
 
-    if all_vals_global:
-        lo = max(0, min(all_vals_global) - 0.05)
-        hi = min(1, max(all_vals_global) + 0.05)
-        for ax in axes: ax.set_ylim(lo, hi)
+            ax = axes[idx]
+            mcls = get_minority_class(client_train_loaders[cid])
+            key = f"f1_class_{mcls}"
 
-    for i in range(num_clients, len(axes)):
-        fig.delaxes(axes[i])
+            # Daten extrahieren
+            vq = [qfl_client_results[s][cid].get(key, np.nan) for s in qfl_client_results]
+            vb = [baseline_client_results[s][cid].get(key, np.nan) for s in baseline_client_results]
 
-    plt.suptitle("Minority-Class F1 under Label Distribution Skew", fontsize=16)
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.show()
+            # NaNs entfernen
+            vq = [x for x in vq if not np.isnan(x)]
+            vb = [x for x in vb if not np.isnan(x)]
+            vals_in_this_figure.extend(vq + vb)
+
+            if len(vq) == 0 and len(vb) == 0:
+                ax.text(0.5, 0.5, "No data", ha="center")
+                continue
+
+            # Plotten (ruft deine styled_boxplot Hilfsfunktion auf)
+            styled_boxplot(ax, [vq, vb], ["QFL", "Baseline"])
+
+            ratio = get_minority_ratio(client_train_loaders[cid])
+            ax.set_title(f"{cid}\n(Minority Class={mcls}, Ratio={ratio:.2f})")
+            ax.set_ylabel("Minority F1")
+            ax.yaxis.grid(True, linestyle='--', alpha=0.5)
+
+        # 4. Y-Achsen Angleichung (Optional, aber empfohlen für Vergleichbarkeit innerhalb des Base-Clients)
+        if vals_in_this_figure:
+            lo = max(0, min(vals_in_this_figure) - 0.05)
+            hi = min(1, max(vals_in_this_figure) + 0.05)
+            # Setze für alle genutzten Achsen das gleiche Limit
+            for i in range(len(sub_clients)):
+                axes[i].set_ylim(lo, hi)
+
+        # Leere Subplots entfernen (falls z.B. 3 Subs in 2x2 Grid)
+        for i in range(num_subs, len(axes)):
+            fig.delaxes(axes[i])
+
+        plt.suptitle(f"Analysis: {base_client} (Sub-Client Breakdown)", fontsize=16)
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+        # Plot anzeigen (erzeugt ein neues Bild pro Loop-Durchlauf)
+        plt.show()
 
 
 def plot_f1_vs_minority_ratio(qfl_client_results, baseline_client_results, client_train_loaders, seeds):
@@ -874,156 +917,161 @@ def plot_class_specific_performance(qfl_client_metrics, baseline_client_metrics,
 def plot_skew_severity_analysis(qfl_client_metrics, baseline_client_metrics,
                                 client_train_loaders, seeds):
     """
-    Korrelation: Je stärker der Skew, desto mehr profitiert man von QFL?
-    VERWENDET MINORITY CLASS F1 (nicht generellen F1!)
+    Analysiert, ob der Vorteil von QFL (Gain) mit der Stärke des Skews korreliert.
+    Unterscheidet farblich nach Datensatz (MedMNIST, RSNA, CheXpert).
     """
     data = []
-    
+
+    # 1. Daten sammeln
     for cid, loader in client_train_loaders.items():
-        labels = get_labels_from_dataset(loader.dataset)
-        counts = Counter(labels)
-        minority_ratio = min(counts.values()) / len(labels)
-        minority_class = get_minority_class(loader)  # 0 oder 1
-        
-        # Skew Severity = Abweichung von 50%
-        skew_severity = abs(0.5 - minority_ratio)
-        
-        for seed in seeds:
-            # WICHTIG: Verwende Minority Class F1, nicht generellen F1!
-            qfl_minority_f1 = qfl_client_metrics[seed][cid].get(f'f1_class_{minority_class}', np.nan)
-            base_minority_f1 = baseline_client_metrics[seed][cid].get(f'f1_class_{minority_class}', np.nan)
-            
-            # Genereller F1 für Vergleich
-            qfl_f1 = qfl_client_metrics[seed][cid]['f1']
-            base_f1 = baseline_client_metrics[seed][cid]['f1']
-            
-            if not np.isnan(qfl_minority_f1) and not np.isnan(base_minority_f1):
-                data.append({
-                    'Client': cid,
-                    'Seed': seed,
-                    'Minority_Ratio': minority_ratio,
-                    'Minority_Class': minority_class,
-                    'Skew_Severity': skew_severity,
-                    'F1_Gain_Minority': qfl_minority_f1 - base_minority_f1,  # HAUPTMETRIK
-                    'F1_Gain_Overall': qfl_f1 - base_f1,  # Zum Vergleich
-                    'QFL_Minority_F1': qfl_minority_f1,
-                    'Baseline_Minority_F1': base_minority_f1,
-                    'QFL_Overall_F1': qfl_f1,
-                    'Baseline_Overall_F1': base_f1
-                })
-    
+        try:
+            # Labels und Counts holen
+            labels = get_labels_from_dataset(loader.dataset)
+            counts = Counter(labels)
+            total = len(labels)
+
+            if total == 0:
+                continue
+
+            # Minority Ratio berechnen
+            n_0 = counts.get(0, 0)
+            n_1 = counts.get(1, 0)
+            minority_ratio = min(n_0, n_1) / total
+
+            # Automatische Erkennung der Minority Class (0 oder 1)
+            minority_class = 0 if n_0 < n_1 else 1
+
+            # Severity: Wie weit ist es von 0.5 entfernt?
+            # 0.0 = Balance, 0.5 = Extremer Skew (nur eine Klasse)
+            skew_severity = abs(0.5 - minority_ratio)
+
+            for seed in seeds:
+                # Metriken holen (Minority F1 & Overall F1)
+                qfl_min_f1 = qfl_client_metrics[seed][cid].get(f'f1_class_{minority_class}', np.nan)
+                base_min_f1 = baseline_client_metrics[seed][cid].get(f'f1_class_{minority_class}', np.nan)
+
+                qfl_f1 = qfl_client_metrics[seed][cid]['f1']
+                base_f1 = baseline_client_metrics[seed][cid]['f1']
+
+                if not np.isnan(qfl_min_f1) and not np.isnan(base_min_f1):
+                    data.append({
+                        'Client': cid,
+                        'Seed': seed,
+                        'Minority_Ratio': minority_ratio,
+                        'Skew_Severity': skew_severity,
+                        'F1_Gain_Minority': qfl_min_f1 - base_min_f1,
+                        'F1_Gain_Overall': qfl_f1 - base_f1
+                    })
+        except Exception as e:
+            print(f"[WARNUNG] Konnte Skew-Analyse für {cid} nicht durchführen: {e}")
+
     df = pd.DataFrame(data)
-    
+
     if len(df) == 0:
-        print("⚠️ No data available for skew severity analysis")
+        print("⚠️ Keine Daten für Skew-Analyse verfügbar.")
         return df
-    
-    # Correlations
+
+    # --- HELPER: Datensatz-Namen zuweisen (HIER WIEDER EINGEFÜGT) ---
+    def get_dataset_name(client_id):
+        if 'client_1' in client_id: return 'MedMNIST'
+        if 'client_4' in client_id: return 'CheXpert'
+        if 'client_2' in client_id or 'client_3' in client_id: return 'RSNA'
+        return 'Other'
+
+    # Wendet die Funktion auf die 'Client' Spalte an
+    df['Dataset'] = df['Client'].apply(get_dataset_name)
+    # ----------------------------------------------------------------
+
+    # 2. Korrelationen berechnen
     corr_minority, p_minority = spearmanr(df['Skew_Severity'], df['F1_Gain_Minority'])
     corr_overall, p_overall = spearmanr(df['Skew_Severity'], df['F1_Gain_Overall'])
-    
-    # Plotting
-    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
-    
-    # Plot 1: Scatter - Minority F1 Gain
+
+    # 3. Plotting
+    fig, axes = plt.subplots(1, 3, figsize=(22, 6))
+
+    # --- PLOT 1: Scatter Minority Gain (Farbe = Datensatz) ---
     ax1 = axes[0]
-    for seed in seeds:
-        subset = df[df['Seed'] == seed]
-        ax1.scatter(subset['Skew_Severity'], subset['F1_Gain_Minority'], 
-                   alpha=0.6, s=100, label=f'Seed {seed}')
-    
-    # Regression Line
-    z = np.polyfit(df['Skew_Severity'], df['F1_Gain_Minority'], 1)
-    p = np.poly1d(z)
-    x_line = np.linspace(df['Skew_Severity'].min(), df['Skew_Severity'].max(), 100)
-    ax1.plot(x_line, p(x_line), 'r--', linewidth=2.5, label=f'Trend (ρ={corr_minority:.3f})')
-    
-    ax1.axhline(0, color='black', linestyle='-', linewidth=1, alpha=0.5)
-    ax1.set_xlabel('Skew Severity (|0.5 - Minority Ratio|)', fontsize=12)
-    ax1.set_ylabel('Minority Class F1 Improvement', fontsize=12)
-    ax1.set_title(f'Skew Severity vs. Minority F1 Gain\n(Spearman ρ={corr_minority:.3f}, p={p_minority:.4f})', 
-                 fontweight='bold', fontsize=14)
+    sns.scatterplot(data=df, x='Skew_Severity', y='F1_Gain_Minority',
+                    hue='Dataset', style='Dataset', s=100, alpha=0.7, ax=ax1)
+
+    # Trendlinie (Gesamt)
+    if len(df) > 1:
+        sns.regplot(data=df, x='Skew_Severity', y='F1_Gain_Minority', scatter=False,
+                    ax=ax1, color='red', line_kws={'linestyle': '--', 'linewidth': 1.5},
+                    label=f'Trend (ρ={corr_minority:.2f})')
+
+    ax1.axhline(0, color='black', linewidth=0.8)
+    ax1.set_xlabel('Skew Severity (|0.5 - Ratio|)', fontsize=12)
+    ax1.set_ylabel('Minority F1 Gain (QFL - Baseline)', fontsize=12)
+    ax1.set_title(f'Gain vs. Skew Severity\n(p={p_minority:.4f})', fontweight='bold')
     ax1.legend()
-    ax1.grid(True, linestyle='--', alpha=0.3)
-    
-    # Plot 2: Comparison - Minority vs. Overall F1 Gain
+    ax1.grid(True, alpha=0.3)
+
+    # --- PLOT 2: Comparison (Minority vs Overall Gain) ---
     ax2 = axes[1]
-    df_melted = df.melt(id_vars=['Skew_Severity'], 
+    df_melted = df.melt(id_vars=['Skew_Severity', 'Dataset'],
                         value_vars=['F1_Gain_Minority', 'F1_Gain_Overall'],
                         var_name='Metric', value_name='F1_Gain')
-    
-    for metric in ['F1_Gain_Minority', 'F1_Gain_Overall']:
-        subset = df_melted[df_melted['Metric'] == metric]
-        label = 'Minority F1' if metric == 'F1_Gain_Minority' else 'Overall F1'
-        color = 'red' if metric == 'F1_Gain_Minority' else 'blue'
-        ax2.scatter(subset['Skew_Severity'], subset['F1_Gain'], 
-                   alpha=0.5, s=80, label=label, color=color)
-        
-        # Trendline
-        z = np.polyfit(subset['Skew_Severity'], subset['F1_Gain'], 1)
-        p_trend = np.poly1d(z)
-        ax2.plot(x_line, p_trend(x_line), linestyle='--', linewidth=2, color=color)
-    
-    ax2.axhline(0, color='black', linestyle='-', linewidth=1)
+
+    metric_labels = {'F1_Gain_Minority': 'Minority Class', 'F1_Gain_Overall': 'Overall Avg'}
+    df_melted['Metric'] = df_melted['Metric'].map(metric_labels)
+
+    sns.scatterplot(data=df_melted, x='Skew_Severity', y='F1_Gain',
+                    hue='Metric', style='Dataset', alpha=0.6, s=80, ax=ax2)
+
+    sns.regplot(data=df_melted[df_melted['Metric'] == 'Minority Class'], x='Skew_Severity', y='F1_Gain',
+                scatter=False, ax=ax2, color='blue', line_kws={'linestyle': '--', 'linewidth': 1}, ci=None)
+    sns.regplot(data=df_melted[df_melted['Metric'] == 'Overall Avg'], x='Skew_Severity', y='F1_Gain',
+                scatter=False, ax=ax2, color='orange', line_kws={'linestyle': ':', 'linewidth': 1}, ci=None)
+
+    ax2.axhline(0, color='black', linewidth=0.8)
     ax2.set_xlabel('Skew Severity', fontsize=12)
     ax2.set_ylabel('F1 Improvement', fontsize=12)
-    ax2.set_title('Minority vs. Overall F1 Improvement', fontweight='bold', fontsize=14)
+    ax2.set_title('Minority vs. Overall Improvement', fontweight='bold')
     ax2.legend()
-    ax2.grid(True, linestyle='--', alpha=0.3)
-    
-    # Plot 3: Binned Analysis - Minority F1
+    ax2.grid(True, alpha=0.3)
+
+    # --- PLOT 3: Boxplot nach Kategorien ---
     ax3 = axes[2]
-    df['Skew_Bin'] = pd.cut(df['Skew_Severity'], 
-                            bins=[0, 0.1, 0.2, 0.3, 0.5],
-                            labels=['Mild (<10%)', 'Moderate (10-20%)', 
-                                   'Severe (20-30%)', 'Extreme (>30%)'])
-    
-    sns.boxplot(data=df, x='Skew_Bin', y='F1_Gain_Minority', ax=ax3, palette='RdYlGn_r')
-    ax3.axhline(0, color='red', linestyle='--', linewidth=1.5)
-    ax3.set_xlabel('Skew Severity Category', fontsize=12)
-    ax3.set_ylabel('Minority F1 Improvement', fontsize=12)
-    ax3.set_title('Minority F1 Gain by Skew Severity', fontweight='bold', fontsize=14)
-    ax3.grid(True, linestyle='--', alpha=0.3, axis='y')
-    
+    # Bins angepasst an deine Verteilung (0.10, 0.25, 0.40)
+    df['Skew_Bin'] = pd.cut(df['Skew_Severity'],
+                            bins=[-0.01, 0.15, 0.30, 0.55],
+                            labels=['Mild (<0.15)', 'Moderate (0.15-0.3)', 'Extreme (>0.3)'])
+
+    sns.boxplot(data=df, x='Skew_Bin', y='F1_Gain_Minority', ax=ax3, palette='viridis')
+    ax3.axhline(0, color='red', linestyle='--', linewidth=1)
+    ax3.set_xlabel('Severity Category', fontsize=12)
+    ax3.set_title('Gain Distribution by Severity', fontweight='bold')
+
     plt.tight_layout()
     plt.show()
-    
-    # Analysis Output
-    print("\n" + "="*80)
+
+    # 4. Text-Output
+    print("\n" + "=" * 80)
     print("📊 SKEW SEVERITY vs. IMPROVEMENT ANALYSIS")
-    print("="*80)
-    
-    print(f"\nMINORITY CLASS F1:")
-    print(f"  Spearman ρ = {corr_minority:.4f}, p = {p_minority:.4f}")
+    print("=" * 80)
+
+    print(f"\n1. MINORITY CLASS F1:")
+    print(f"   Spearman ρ = {corr_minority:.4f}, p = {p_minority:.4f}")
     if p_minority < 0.05:
-        if corr_minority > 0:
-            print("  ✓ POSITIVE correlation: Stronger skew → MORE minority class benefit from QFL")
-        else:
-            print("  ✓ NEGATIVE correlation: Stronger skew → LESS minority class benefit")
+        dir_str = "MORE" if corr_minority > 0 else "LESS"
+        print(f"   ✓ SIGNIFIKANT: Stronger skew → {dir_str} benefit from QFL")
     else:
-        print("  ✗ No significant correlation")
-    
-    print(f"\nOVERALL F1 (for comparison):")
-    print(f"  Spearman ρ = {corr_overall:.4f}, p = {p_overall:.4f}")
-    if p_overall < 0.05:
-        print(f"  ✓ Significant correlation")
-    else:
-        print("  ✗ No significant correlation")
-    
-    print("\nMinority F1 Gain by Severity:")
-    for bin_name in df['Skew_Bin'].cat.categories:
+        print("   ✗ Keine signifikante Korrelation")
+
+    print(f"\n2. OVERALL F1 (Vergleich):")
+    print(f"   Spearman ρ = {corr_overall:.4f}, p = {p_overall:.4f}")
+
+    print("\n3. Details per Category:")
+    for bin_name in ['Mild (<0.15)', 'Moderate (0.15-0.3)', 'Extreme (>0.3)']:
         subset = df[df['Skew_Bin'] == bin_name]
         if len(subset) > 0:
-            minority_gain = subset['F1_Gain_Minority'].mean()
-            overall_gain = subset['F1_Gain_Overall'].mean()
-            print(f"  {bin_name}:")
-            print(f"    Minority F1 Gain: {minority_gain:+.4f} ± {subset['F1_Gain_Minority'].std():.4f}")
-            print(f"    Overall F1 Gain:  {overall_gain:+.4f} ± {subset['F1_Gain_Overall'].std():.4f}")
-    
-    print("="*80 + "\n")
-    
-    return df
+            avg_gain = subset['F1_Gain_Minority'].mean()
+            print(f"   {bin_name:<18}: Avg Minority Gain = {avg_gain:+.4f} (n={len(subset)})")
 
+    print("=" * 80 + "\n")
+
+    return df
 
 def analyze_lds_resilience(qfl_client_metrics, baseline_client_metrics,
                            client_train_loaders, seeds, skew_threshold=0.3):
