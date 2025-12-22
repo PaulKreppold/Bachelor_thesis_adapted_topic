@@ -1,72 +1,219 @@
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import MinMaxScaler
-import numpy as np
-from torch.utils.data import TensorDataset
-from medmnist import PneumoniaMNIST
+import os
 import torch
-from torch.utils.data import DataLoader
+import pandas as pd
+import numpy as np
+from torch.utils.data import DataLoader, Dataset, Subset
+import torchvision.transforms as transforms
+from medmnist import PneumoniaMNIST
+from PIL import Image
+from sklearn.model_selection import train_test_split
+from config import clients, BATCH_SIZE
 
-BASE_DIR = '/Users/paulkreppold/Local_datasets'
-RSNA_PATH = os.path.join(BASE_DIR, 'RSNA_Pneumonia_Detection_Challenge')
-CHEXPERT_PATH = os.path.join(BASE_DIR, 'CheXpert_Frontal_Processed')
-EXTERNAL_DATA_PATH = os.path.join(BASE_DIR, 'Covid19-Pneumonia-Normal Chest X-Ray Images Dataset_mendely_data')
+# -----------------------------
+# Konstanten
+# -----------------------------
+# Wir nutzen die Gesamtgröße von PneumoniaMNIST als Referenz für RSNA Downsampling
+TARGET_TOTAL_SAMPLES = 5856
 
 
+def get_rsna_metadata_split(metadata_csv):
+    """Teilt die RSNA Metadaten strikt nach Patienten-IDs auf zwei disjunkte Pools auf."""
+    df = pd.read_csv(metadata_csv)
+    # Sicherstellen, dass Duplikate (mehrere Boxen pro Patient) die ID-Trennung nicht korrumpieren
+    patient_ids = df['patientId'].unique()
+    ids_c2, ids_c3 = train_test_split(patient_ids, test_size=0.5, random_state=42)
+
+    # Filtern der Dataframes basierend auf den IDs
+    df_c2 = df[df['patientId'].isin(ids_c2)].drop_duplicates(subset=['patientId']).copy()
+    df_c3 = df[df['patientId'].isin(ids_c3)].drop_duplicates(subset=['patientId']).copy()
+    return df_c2, df_c3
 
 
-def load_data_pca(batch_size=32, n_components=10):
-    """
-    Lädt PneumoniaMNIST, flacht es ab und reduziert es via PCA auf n_components.
-    """
-    print(f"[PCA] Starte Datenladung und Reduktion auf {n_components} Features...")
+# -----------------------------
+# Datasets
+# -----------------------------
+class RSNADataset(Dataset):
+    def __init__(self, df_pool, images_dir, transform=None, ratio_normal=0.5, target_size=TARGET_TOTAL_SAMPLES):
+        self.transform = transform
 
-    # 1. Daten "roh" laden (als Numpy Arrays)
-    # Wir nutzen hier die Bibliotheks-Funktion, um direkt an die Daten zu kommen
-    train_dataset = PneumoniaMNIST(split='train', download=True, size=28)
-    val_dataset = PneumoniaMNIST(split='val', download=True, size=28)
-    test_dataset = PneumoniaMNIST(split='test', download=True, size=28)
+        # Klassen-Trennung für gezieltes Sampling
+        normal_df = df_pool[df_pool['Target'] == 0]
+        pneum_df = df_pool[df_pool['Target'] == 1]
 
-    # Bilder extrahieren und flatten (N, 784)
-    # .imgs ist (N, 28, 28) -> reshape zu (N, 784)
-    X_train = train_dataset.imgs.reshape(len(train_dataset), -1).astype(np.float32)
-    X_val = val_dataset.imgs.reshape(len(val_dataset), -1).astype(np.float32)
-    X_test = test_dataset.imgs.reshape(len(test_dataset), -1).astype(np.float32)
+        n_normal = int(target_size * ratio_normal)
+        n_pneum = target_size - n_normal
 
-    y_train = train_dataset.labels.astype(np.float32)  # Labels behalten
-    y_val = val_dataset.labels.astype(np.float32)
-    y_test = test_dataset.labels.astype(np.float32)
+        # Sampling durchführen (mit Fallback, falls Pool zu klein)
+        s_normal = normal_df.sample(n=min(n_normal, len(normal_df)), random_state=42)
+        s_pneum = pneum_df.sample(n=min(n_pneum, len(pneum_df)), random_state=42)
 
-    # 2. PCA anwenden
-    # WICHTIG: Fit nur auf TRAIN Daten, um Data Leakage zu vermeiden!
-    pca = PCA(n_components=n_components)
+        self.df = pd.concat([s_normal, s_pneum]).reset_index(drop=True)
+        self.labels = self.df['Target'].values
+        self.paths = [os.path.join(images_dir, f"{pid}.png") for pid in self.df['patientId']]
 
-    print("   -> Fitte PCA auf Trainingsdaten...")
-    X_train_pca = pca.fit_transform(X_train)
+    def __len__(self):
+        return len(self.df)
 
-    # Transform auf Val und Test anwenden (mit der Matrix von Train)
-    X_val_pca = pca.transform(X_val)
-    X_test_pca = pca.transform(X_test)
+    def __getitem__(self, idx):
+        try:
+            # RSNA Bilder sind oft sehr groß, 'L' konvertiert zu Grayscale
+            img = Image.open(self.paths[idx]).convert('L')
+            if self.transform:
+                img = self.transform(img)
+            return img, self.labels[idx]
+        except Exception as e:
+            # Rückfalloption bei fehlenden/korrupten Dateien
+            return torch.zeros((1, 32, 32)), self.labels[idx]
 
-    # 3. Skalierung für AngleEmbedding
-    # Wir wollen Winkel zwischen 0 und Pi (oder -Pi bis Pi).
-    # AngleEmbedding mag normierte Werte.
-    scaler = MinMaxScaler(feature_range=(0, np.pi))
 
-    X_train_pca = scaler.fit_transform(X_train_pca)
-    X_val_pca = scaler.transform(X_val_pca)
-    X_test_pca = scaler.transform(X_test_pca)
+# -----------------------------
+# Loader & Verteilung
+# -----------------------------
+def get_pneumonia_dataloaders(batch_size=BATCH_SIZE, num_workers=0, download=True):
+    """Standard MedMNIST Pneumonia Loader für Client 1."""
+    train_transform = transforms.Compose([
+        transforms.Resize((28, 28)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(10),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5], std=[0.5])
+    ])
+    test_transform = transforms.Compose([
+        transforms.Resize((28, 28)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5], std=[0.5])
+    ])
 
-    print(f"   -> Datenform nach PCA: {X_train_pca.shape}")
-    print(f"   -> Erklärte Varianz (Info-Gehalt): {np.sum(pca.explained_variance_ratio_):.2%}")
+    train_dataset = PneumoniaMNIST(split='train', transform=train_transform, download=download)
+    val_dataset = PneumoniaMNIST(split='val', transform=test_transform, download=download)
+    test_dataset = PneumoniaMNIST(split='test', transform=test_transform, download=download)
 
-    # 4. Zurück in PyTorch Tensoren und DataLoader
-    # WICHTIG: Labels für BCE müssen [N, 1] sein
-    train_ds = TensorDataset(torch.tensor(X_train_pca), torch.tensor(y_train))
-    val_ds = TensorDataset(torch.tensor(X_val_pca), torch.tensor(y_val))
-    test_ds = TensorDataset(torch.tensor(X_test_pca), torch.tensor(y_test))
+    return (DataLoader(train_dataset, batch_size=batch_size, shuffle=True),
+            DataLoader(val_dataset, batch_size=batch_size, shuffle=False),
+            DataLoader(test_dataset, batch_size=batch_size, shuffle=False))
 
-    loaders_train = {"client_1": DataLoader(train_ds, batch_size=batch_size, shuffle=True)}
-    loaders_val = {"client_1": DataLoader(val_ds, batch_size=batch_size, shuffle=False)}
-    loaders_test = {"client_1": DataLoader(test_ds, batch_size=batch_size, shuffle=False)}
 
-    return loaders_train, loaders_val, loaders_test
+def get_rsna_loaders(client_id, df_pool, batch_size=BATCH_SIZE, val_split=0.1, test_split=0.1):
+    """Spezialisierte Loader für Client 2 und 3 mit getrennten Transforms."""
+    base_dir = "/Users/paulkreppold/Local_datasets/RSNA_Pneumonia_Detection_Challenge"
+    images_dir = os.path.join(base_dir, "Training/Images")
+
+    # 1. TRAINING-Transform (mit Augmentation)
+    rsna_train_transform = transforms.Compose([
+        transforms.Resize(128),
+        transforms.CenterCrop(100),
+        transforms.Resize((32, 32)),
+        transforms.ColorJitter(contrast=0.2, brightness=0.2),  # Nur hier!
+        transforms.RandomHorizontalFlip(),  # Optional: erhöht Robustheit
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5], std=[0.5])
+    ])
+
+    # 2. EVALUATION-Transform (Rein und konsistent)
+    rsna_test_transform = transforms.Compose([
+        transforms.Resize(128),
+        transforms.CenterCrop(100),
+        transforms.Resize((32, 32)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5], std=[0.5])
+    ])
+
+    # Unterschiedliche Label-Verteilung (Non-IID Simulation)
+    ratio_normal = 0.6 if client_id == 'client_2' else 0.4
+
+    # Dataset initial erstellen (noch ohne transform, um flexibel zu bleiben)
+    # Oder: Wir erstellen zwei Instanzen mit derselben DF-Basis
+    full_dataset = RSNADataset(df_pool, images_dir, transform=None, ratio_normal=ratio_normal)
+
+    # Indizes splitten
+    indices = np.arange(len(full_dataset))
+    trainval_idx, test_idx = train_test_split(indices, test_size=test_split, stratify=full_dataset.labels,
+                                              random_state=42)
+
+    val_size_adj = val_split / (1 - test_split)
+    train_idx, val_idx = train_test_split(trainval_idx, test_size=val_size_adj,
+                                          stratify=full_dataset.labels[trainval_idx], random_state=42)
+
+    # Subsets erstellen
+    train_subset = Subset(full_dataset, train_idx)
+    val_subset = Subset(full_dataset, val_idx)
+    test_subset = Subset(full_dataset, test_idx)
+
+    # TRICK: Wir weisen den Subsets die spezifischen Transforms zu
+    # Da Subset nur auf das Original-Dataset zeigt, überschreiben wir die Dataset-Instanz
+    # für die Loader oder nutzen eine kleine Wrapper-Klasse (Sauberste Lösung)
+
+    class ApplyTransform(Dataset):
+        def __init__(self, subset, transform):
+            self.subset = subset
+            self.transform = transform
+
+        def __getitem__(self, index):
+            x, y = self.subset[index]
+            # Hier wenden wir die Transformation auf das PIL Image an
+            # (Das Original-Dataset muss dafür das Image OHNE transform zurückgeben)
+            if self.transform:
+                x = self.transform(x)
+            return x, y
+
+        def __len__(self):
+            return len(self.subset)
+
+    # Da dein RSNADataset das Transform im __getitem__ anwendet,
+    # setzen wir dort transform=None und nutzen den Wrapper:
+    full_dataset.transform = None
+
+    return (DataLoader(ApplyTransform(train_subset, rsna_train_transform), batch_size=batch_size, shuffle=True),
+            DataLoader(ApplyTransform(val_subset, rsna_test_transform), batch_size=batch_size, shuffle=False),
+            DataLoader(ApplyTransform(test_subset, rsna_test_transform), batch_size=batch_size, shuffle=False))
+
+
+def get_all_client_loaders(batch_size=BATCH_SIZE):
+    """Zentrale Funktion zum Abrufen aller Client-Loader."""
+    client_loaders = {}
+    base_dir = "/Users/paulkreppold/Local_datasets/RSNA_Pneumonia_Detection_Challenge"
+    metadata_csv = os.path.join(base_dir, "stage2_train_metadata.csv")
+
+    # Einmaliges Splitten der RSNA Datenquelle für Client 2 und 3
+    df_pool_c2, df_pool_c3 = get_rsna_metadata_split(metadata_csv)
+
+    for client_id in clients:
+        if client_id == 'client_1':
+            tl, vl, tsl = get_pneumonia_dataloaders(batch_size)
+        elif client_id == 'client_2':
+            tl, vl, tsl = get_rsna_loaders(client_id, df_pool_c2, batch_size)
+        elif client_id == 'client_3':
+            tl, vl, tsl = get_rsna_loaders(client_id, df_pool_c3, batch_size)
+        client_loaders[client_id] = {"train": tl, "val": vl, "test": tsl}
+
+    return client_loaders
+
+
+# -----------------------------
+# Analyse-Tools
+# -----------------------------
+def print_class_distributions(client_loaders):
+    """Gibt eine Übersicht über die Verteilung der Klassen pro Client aus."""
+    data = []
+    for cid, loaders in client_loaders.items():
+        for split in ['train', 'val', 'test']:
+            all_y = []
+            # Wir iterieren durch den DataLoader, um die Labels zu zählen
+            for _, labels in loaders[split]:
+                all_y.extend(labels.tolist())
+
+            all_y = np.array(all_y)
+            tot = len(all_y)
+            n1 = int(np.sum(all_y))
+            n0 = tot - n1
+            data.append([cid, split.upper(), tot, f"{n0} ({n0 / tot:.1%})", f"{n1} ({n1 / tot:.1%})"])
+
+    df = pd.DataFrame(data, columns=['Client', 'Split', 'Total', 'Normal (0)', 'Pneumonie (1)'])
+    print(f"\n{'=' * 75}\n{'ÜBERSICHT KLASSENVERTEILUNG':^75}\n{'=' * 75}")
+    print(df.to_string(index=False, justify='center', col_space=12))
+
+
+if __name__ == "__main__":
+    # Test-Lauf
+    loaders = get_all_client_loaders()
+    print_class_distributions(loaders)

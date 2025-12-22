@@ -1,118 +1,128 @@
 import torch
-import torch.nn as nn
+import torch.optim as optim
 import numpy as np
 import random
-import pennylane as qml
+import os
 
-# Eigene Module
+# Import der Konfiguration aus config.py
+from config import *
+
+# Import der eigenen Module
 from Base_Line import QuantumModel
-from data_prep import load_data_pca
-from train_and_eval import train_client, evaluate_model
-from plots import plot_train_accuracy_and_loss
-
-# Config Import
-from config import device, client_qubits
-
-# ==========================================
-# KONFIGURATION
-# ==========================================
-SEEDS = [42, 1337, 2024, 112, 19]
-num_epochs = 50
-learning_rate = 0.001
-batch_size = 4
-num_layers = 4
-
-# Fest auf client_1 gesetzt
-client_id = "client_1"
-
-# Qubits direkt holen (Crash bei Fehler, kein Fallback)
-num_qubits = client_qubits[client_id]
+from train_and_eval import train_client, evaluate_model, visualize_batch_analysis
+from plots import plot_train_accuracy_and_loss_comparative
+from data_prep import get_all_client_loaders, print_class_distributions
 
 
 def set_seed(seed):
+    """Fixiert alle Random-Seeds für maximale Vergleichbarkeit."""
     torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
-# ==========================================
-# MAIN LOOP
-# ==========================================
-if __name__ == "__main__":
-    print(f"Start Baseline Training auf Device: {device}")
-    print(f"Client: {client_id} | Qubits: {num_qubits} | Layers: {num_layers}")
+def main():
+    header_width = 100
+    print("\n" + "█" * header_width)
+    print(f"{' VQC ARCHITECTURE COMPARISON: 4-WAY ANALYSIS ':^{header_width}}")
+    print(f"{' StronglyEntangling vs. EfficientSU2 | Pure vs. Calibrated ':^{header_width}}")
+    print("█" * header_width)
 
     # 1. Daten laden
-    print("\n[INIT] Lade Daten...")
-    train_loaders, val_loaders, test_loaders = load_data_pca(batch_size=batch_size)
+    print("[*] Initialisiere Data-Loaders...")
+    client_loaders = get_all_client_loaders(batch_size=BATCH_SIZE)
 
-    # Zugriff auf die Loader von client_1
-    train_loader = train_loaders[client_id]
-    val_loader_dict = {client_id: val_loaders[client_id]}  # Für Validierung während Training
-    test_loader = test_loaders[client_id]
+    # Übersicht der Klassenverteilung pro Client anzeigen
+    print_class_distributions(client_loaders)
 
-    # ==========================================
-    # SEED LOOP
-    # ==========================================
+    # Definition der Architekturen aus dem Paper-Kontext
+    ansatz_types = ["StronglyEntangling", "EfficientSU2"]
+
+    # 2. Hauptschleife über die Seeds
     for seed in SEEDS:
-        print("\n" + "=" * 60)
-        print(f" START TRAINING RUN - SEED {seed} ")
-        print("=" * 60)
+        print(f"\n\n{'#' * 100}")
+        print(f"#{f' STARTING EXPERIMENTS FOR SEED {seed} '.center(98)}#")
+        print(f"{'#' * 100}")
 
-        set_seed(seed)
+        for client_id in clients:
+            # 3. Architektur-Schleife (VQC Typen)
+            for ansatz in ansatz_types:
 
-        # 2. Modell initialisieren
-        print(f"[Seed {seed}] Initialisiere Quantum Model...")
-        model = QuantumModel(num_qubits=num_qubits, num_layers=num_layers).to(device)
+                # 4. Kalibrierungs-Schleife (Pure vs. Scale & Bias)
+                for use_scale in [False, True]:
 
-        # 3. Setup
-        criterion = nn.MSELoss()
-        optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+                    # WICHTIG: Seed vor JEDEM Durchlauf neu fixieren für identische Initialgewichte
+                    set_seed(seed)
 
-        # 4. Training
-        print(f"[Seed {seed}] Starte Training ({num_epochs} Epochen)...")
-        results = train_client(
-            model=model,
-            client_train_loader=train_loader,
-            criterion=criterion,
-            optimizer=optimizer,
-            client_id=client_id,
-            num_epochs=num_epochs,
-            client_val_loaders=val_loader_dict,
-            print_last_only=False,
-            last_round=True
-        )
+                    # Label für Logs und Plots erstellen
+                    calib_status = "Calibrated" if use_scale else "Pure"
+                    mode_label = f"{ansatz}_{calib_status}"
 
-        # 5. Evaluation
-        print(f"[Seed {seed}] Evaluiere auf Test-Set...")
-        eval_out = evaluate_model(model, test_loader, criterion)
+                    print(f"\n>>> [CLIENT: {client_id}] | ARCH: {ansatz} | MODE: {calib_status} | Seed: {seed}")
 
-        (test_acc, test_loss, test_f1, test_auc, test_auc_pr,
-         test_precision, test_recall, test_cm,
-         test_probs, test_labels, test_class_f1) = eval_out
+                    # Modell erstellen mit dynamischer Architektur-Wahl
+                    model = QuantumModel(
+                        num_qubits=10,
+                        num_layers=NUM_LAYERS,
+                        use_scaling=use_scale,
+                        ansatz_type=ansatz
+                    ).to(device)
 
-        # 6. Ergebnisse
-        print("-" * 40)
-        print(f"ERGEBNISSE SEED {seed}")
-        print("-" * 40)
-        print(f"Test Accuracy:  {test_acc:.2f}%")
-        print(f"Test Loss:      {test_loss:.4f}")
-        print(f"Test F1-Score:  {test_f1:.4f}")
-        print(f"Test AUC:       {test_auc:.4f}")
-        print(f"Confusion Matrix:\n{test_cm}")
-        print("-" * 40)
+                    # Optimizer (LR kommt aus config.py)
+                    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-        # 7. Plotten (ohne Speichern)
-        plot_train_accuracy_and_loss(
-            train_losses=results["train_losses"],
-            train_accuracies=results["train_accuracies"],
-            seed=seed
-        )
+                    # --- TRAINING ---
+                    results = train_client(
+                        model=model,
+                        train_loader=client_loaders[client_id]['train'],
+                        optimizer=optimizer,
+                        client_id=client_id,
+                        num_epochs=NUM_EPOCHS,
+                        device=device,
+                        mode_label=mode_label
+                    )
 
-    print("\n" + "=" * 60)
-    print(" ALLE SEEDS ABGESCHLOSSEN ")
-    print("=" * 60)
+                    # --- EVALUATION ---
+                    print(f"[*] Evaluiere {client_id} auf Test-Set...")
+                    acc, (f1_normal, f1_krank), _, _ = evaluate_model(
+                        model,
+                        client_loaders[client_id]['test'],
+                        device=device
+                    )
+
+                    # Detaillierte Resultat-Ausgabe
+                    print(f"\n[RESULTAT - {mode_label}]")
+                    print(f"Acc: {acc:.2f}% | F1-Normal: {f1_normal:.4f} | F1-Krank: {f1_krank:.4f}")
+
+                    # --- BATCH-ANALYSE (Visualisierung der Rohwerte und Parameter) ---
+                    visualize_batch_analysis(
+                        model=model,
+                        test_loader=client_loaders[client_id]['test'],
+                        client_id=client_id,
+                        mode_label=mode_label,
+                        device=device
+                    )
+
+                    # --- PLOTTING ---
+                    try:
+                        plot_train_accuracy_and_loss_comparative(
+                            train_losses=results["train_losses"],
+                            train_accuracies=results["train_accuracies"],
+                            seed=seed,
+                            client_id=client_id,
+                            mode_label=mode_label
+                        )
+                    except Exception as e:
+                        print(f"[!] Plot-Fehler bei {client_id} ({mode_label}): {e}")
+
+    print("\n" + "█" * header_width)
+    print(f"{' ALLE EXPERIMENTE (4 KONFIGURATIONEN) ERFOLGREICH BEENDET ':^{header_width}}")
+    print("█" * header_width + "\n")
+
+
+if __name__ == "__main__":
+    main()
