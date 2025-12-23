@@ -1,112 +1,164 @@
 import torch
 import torch.nn as nn
 import numpy as np
-import pandas as pd
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import (
+    accuracy_score, f1_score, precision_score, recall_score,
+    roc_auc_score, average_precision_score, confusion_matrix
+)
 
 
 def train_client(model, train_loader, optimizer, client_id, num_epochs, val_loader=None, device="cpu",
-                 mode_label="Pure"):
-    # BCEWithLogitsLoss ist numerisch stabiler
+                 mode_label="Baseline"):
+
     criterion = nn.BCEWithLogitsLoss()
-    history = {"train_losses": [], "train_accuracies": []}
+
+    history = {
+        "train": {
+            "loss": [],
+            "accuracy": [],
+            "f1_normal": [],
+            "f1_krank": []
+        }
+    }
+    if val_loader is not None:
+        history["val"] = {
+            "loss": [],
+            "accuracy": [],
+            "f1_normal": [],
+            "f1_krank": []
+        }
+
+    n_samples = 0
 
     for epoch in range(num_epochs):
         model.train()
-        running_loss, correct, total = 0.0, 0, 0
-        for images, labels in train_loader:
-            images, labels = images.to(device), labels.float().view(-1, 1).to(device)
-            optimizer.zero_grad()
+        epoch_losses = []
+        all_preds, all_labels = [], []
 
+        for images, labels in train_loader:
+            images = images.to(device)
+            # shape entspricht (Batch, 1)
+            labels = labels.float().view(-1, 1).to(device)
+
+            optimizer.zero_grad()
             logits = model(images)
             loss = criterion(logits, labels)
             loss.backward()
             optimizer.step()
 
-            running_loss += loss.item()
-            # Bei Logits: Alles > 0.0 ist Klasse 1
-            preds = (logits >= 0.0).float()
-            correct += (preds == labels).sum().item()
-            total += labels.size(0)
+            epoch_losses.append(loss.item())
 
-        epoch_acc = 100.0 * correct / total
-        epoch_loss = running_loss / len(train_loader)
-        history["train_losses"].append(epoch_loss)
-        history["train_accuracies"].append(epoch_acc)
+            # Prediction: Logits >= 0.0 -> Klasse 1
+            preds = (logits >= 0.0).float()
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+            if epoch == 0:
+                n_samples += labels.size(0)
+
+        all_preds = np.array(all_preds).flatten()
+        all_labels = np.array(all_labels).flatten()
+
+        train_loss = np.mean(epoch_losses)
+        train_acc = accuracy_score(all_labels, all_preds) * 100.0
+        # F1-Scores pro Klasse [Normal, Krank]
+        train_f1s = f1_score(all_labels, all_preds, labels=[0, 1], average=None, zero_division=0)
+
+        history["train"]["loss"].append(train_loss)
+        history["train"]["accuracy"].append(train_acc)
+        history["train"]["f1_normal"].append(train_f1s[0])
+        history["train"]["f1_krank"].append(train_f1s[1])
+
+        val_str = ""
+        if val_loader is not None:
+            val_metrics = evaluate_model(model, val_loader, device)
+            history["val"]["loss"].append(val_metrics["loss"])
+            history["val"]["accuracy"].append(val_metrics["accuracy"])
+            history["val"]["f1_normal"].append(val_metrics["f1_normal"])
+            history["val"]["f1_krank"].append(val_metrics["f1_krank"])
+
+            val_str = (f" | Val Loss: {val_metrics['loss']:.4f} "
+                       f"| Val Acc: {val_metrics['accuracy']:.2f}% "
+                       f"| Val F1-N: {val_metrics['f1_normal']:.3f}")
 
         print(
-            f"[{client_id} | {mode_label}] Ep [{epoch + 1}/{num_epochs}] Loss: {epoch_loss:.4f} Acc: {epoch_acc:.2f}%")
+            f"[{client_id} | {mode_label}] "
+            f"Ep {epoch + 1}/{num_epochs} | "
+            f"Train Loss: {train_loss:.4f} | "
+            f"Train Acc: {train_acc:.2f}%"
+            f"{val_str}"
+        )
 
-    return history
+    # Gewichte für Aggregation sicher kopieren
+    safe_weights = {
+        k: v.cpu().detach().clone() for k, v in model.state_dict().items()
+    }
+
+    return {
+        "weights": safe_weights,
+        "n_samples": n_samples,
+        "history": history
+    }
 
 
 def evaluate_model(model, loader, device="cpu"):
+
+    # Berechnet Metriken zur Analyse von Label Skew (F1 pro Klasse, Precision, Recall, AUC)
     model.eval()
-    all_labels, all_probs = [], []
+    criterion = nn.BCEWithLogitsLoss()
+
+    total_loss = 0.0
+    all_logits, all_labels = [], []
+
     with torch.no_grad():
         for images, labels in loader:
-            images, labels = images.to(device), labels.float().view(-1, 1).to(device)
+            images = images.to(device)
+            labels = labels.float().view(-1, 1).to(device)
+
             logits = model(images)
-            probs = torch.sigmoid(logits)
-            all_labels.extend(labels.cpu().numpy())
-            all_probs.extend(probs.cpu().numpy())
+            loss = criterion(logits, labels)
 
-    all_labels = np.array(all_labels).flatten()
-    all_probs = np.array(all_probs).flatten()
-    all_preds = (all_probs >= 0.5).astype(float)
+            total_loss += loss.item() * labels.size(0)
+            all_logits.append(logits.cpu())
+            all_labels.append(labels.cpu())
 
-    acc = accuracy_score(all_labels, all_preds) * 100.0
+    # Zusammenführen der Batches
+    all_logits = torch.cat(all_logits).numpy().flatten()
+    all_labels = torch.cat(all_labels).numpy().flatten()
 
-    # PRO-TIP: labels=[0, 1] erzwingt, dass IMMER zwei Werte zurückkommen.
-    # Der erste Wert ist immer Klasse 0, der zweite immer Klasse 1.
-    f1_scores = f1_score(all_labels, all_preds, labels=[0, 1], average=None, zero_division=0)
+    # Wahrscheinlichkeiten (Sigmoid) und binäre prediction
+    probs = 1 / (1 + np.exp(-all_logits))
+    preds = (all_logits >= 0.0).astype(float)
 
-    f1_normal = f1_scores[0]
-    f1_krank = f1_scores[1]
+    avg_loss = total_loss / len(all_labels)
 
-    return acc, (f1_normal, f1_krank), all_probs, all_labels
+    # F1 pro Klasse
+    f1_per_class = f1_score(all_labels, preds, labels=[0, 1], average=None, zero_division=0)
 
+    # Prüfung auf mehrere Klassen für AUC
+    unique_labels = len(np.unique(all_labels))
 
-def visualize_batch_analysis(model, test_loader, client_id, mode_label, device):
-    model.eval()
-    scale_param = getattr(model, 'scale', None)
-    bias_param = getattr(model, 'bias', None)
-    current_scale = scale_param.item() if scale_param is not None else 1.0
-    current_bias = bias_param.item() if bias_param is not None else 0.0
+    metrics = {
+        "loss": avg_loss,
+        "accuracy": accuracy_score(all_labels, preds) * 100.0,
 
-    images, labels = next(iter(test_loader))
-    images, labels = images.to(device), labels.to(device)
+        "f1_macro": f1_score(all_labels, preds, average="macro", zero_division=0),
+        "f1_normal": float(f1_per_class[0]),
+        "f1_krank": float(f1_per_class[1]),
 
-    with torch.no_grad():
-        # 1. Quanten-Output (Erwartungswert PauliZ: -1 bis 1)
-        q_raw = model.qlayer(images.view(images.size(0), -1)).view(-1)
-        # 2. Logits berechnen
-        logits = (q_raw * current_scale) + current_bias
-        # 3. In Wahrscheinlichkeit umrechnen
-        probs = torch.sigmoid(logits)
+        "precision_normal": precision_score(all_labels, preds, pos_label=0, zero_division=0),
+        "precision_krank": precision_score(all_labels, preds, pos_label=1, zero_division=0),
+        "recall_normal": recall_score(all_labels, preds, pos_label=0, zero_division=0),
+        "recall_krank": recall_score(all_labels, preds, pos_label=1, zero_division=0),
 
-        res = []
-        for i in range(len(images)):
-            x = q_raw[i].item()
-            p = probs[i].item()
-            gt = int(labels[i].item())
-            pred = 1 if p >= 0.5 else 0
+        # AUC-Metriken (Sensibel für Konfidenz)
+        "auc_roc": roc_auc_score(all_labels, probs) if unique_labels > 1 else np.nan,
+        "auc_pr": average_precision_score(all_labels, probs) if unique_labels > 1 else np.nan,
 
-            res.append({
-                "Bild": f"Bild {i + 1:02d}",
-                "VQC Raw (x)": f"{x:8.4f}",
-                "Prob": f"{p * 100:6.1f}%",
-                "GT": gt,
-                "Pred": pred,
-                "Ergebnis": "✅" if pred == gt else "❌"
-            })
+        "confusion_matrix": confusion_matrix(all_labels, preds, labels=[0, 1]),
 
-    df = pd.DataFrame(res)
-    print(f"\n" + "=" * 85)
-    print(f" BATCH ANALYSE: {client_id} ({mode_label}) ".center(85))
-    print("-" * 85)
-    print(f" GELERNTE PARAMETER:  Scale = {current_scale:.4f}  |  Bias = {current_bias:.4f}")
-    print(f" MATHEMATIK:          Prob = Sigmoid({current_scale:.2f} * Raw_x + {current_bias:.2f})")
-    print("-" * 85)
-    print(df.to_string(index=False))
-    print("=" * 85 + "\n")
+        "probs": probs,
+        "labels": all_labels
+    }
+
+    return metrics

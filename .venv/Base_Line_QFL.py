@@ -3,125 +3,69 @@ import torch.optim as optim
 import numpy as np
 import random
 import os
+import copy
 
-# Import der Konfiguration aus config.py
-from config import *
-
-# Import der eigenen Module
+from config import device, clients, seeds, num_layers, learning_rate, batch_size, qfl_num_rounds, qfl_epochs, \
+    baseline_epochs
 from Base_Line import QuantumModel
-from train_and_eval import train_client, evaluate_model, visualize_batch_analysis
-from plots import plot_train_accuracy_and_loss_comparative
+from train_and_eval import train_client, evaluate_model
+from aggregation_method import aggregate_models
 from data_prep import get_all_client_loaders, print_class_distributions
+from plots import run_full_evaluation_suite
 
 
 def set_seed(seed):
-    """Fixiert alle Random-Seeds für maximale Vergleichbarkeit."""
-    torch.manual_seed(seed)
+    torch.manual_seed(seed);
     torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
+    np.random.seed(seed);
     random.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
     torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
 
 def main():
-    header_width = 100
-    print("\n" + "█" * header_width)
-    print(f"{' VQC ARCHITECTURE COMPARISON: 4-WAY ANALYSIS ':^{header_width}}")
-    print(f"{' StronglyEntangling vs. EfficientSU2 | Pure vs. Calibrated ':^{header_width}}")
-    print("█" * header_width)
-
-    # 1. Daten laden
-    print("[*] Initialisiere Data-Loaders...")
-    client_loaders = get_all_client_loaders(batch_size=BATCH_SIZE)
-
-    # Übersicht der Klassenverteilung pro Client anzeigen
+    client_loaders = get_all_client_loaders(batch_size=batch_size)
     print_class_distributions(client_loaders)
 
-    # Definition der Architekturen aus dem Paper-Kontext
-    ansatz_types = ["StronglyEntangling", "EfficientSU2"]
+    qfl_res, base_res = {s: {} for s in seeds}, {s: {} for s in seeds}
+    qfl_hists, base_hists = {s: {} for s in seeds}, {s: {} for s in seeds}
 
-    # 2. Hauptschleife über die Seeds
-    for seed in SEEDS:
-        print(f"\n\n{'#' * 100}")
-        print(f"#{f' STARTING EXPERIMENTS FOR SEED {seed} '.center(98)}#")
-        print(f"{'#' * 100}")
+    for seed in seeds:
+        print(f"\n{'#' * 60}\n# START SEED {seed}\n{'#' * 60}")
 
-        for client_id in clients:
-            # 3. Architektur-Schleife (VQC Typen)
-            for ansatz in ansatz_types:
+        # BASELINE
+        for cid in clients:
+            set_seed(seed)
+            model = QuantumModel(num_qubits=10, num_layers=num_layers).to(device)
+            opt = optim.Adam(model.parameters(), lr=learning_rate)
 
-                # 4. Kalibrierungs-Schleife (Pure vs. Scale & Bias)
-                for use_scale in [False, True]:
+            res = train_client(model, client_loaders[cid]['train'], opt, cid, baseline_epochs,
+                               client_loaders[cid]['val'], device, "Baseline")
+            base_res[seed][cid] = evaluate_model(model, client_loaders[cid]['test'], device)
+            base_hists[seed][cid] = res["history"]
 
-                    # WICHTIG: Seed vor JEDEM Durchlauf neu fixieren für identische Initialgewichte
-                    set_seed(seed)
+        # QFL
+        set_seed(seed)
+        global_model = QuantumModel(num_qubits=10, num_layers=num_layers).to(device)
+        for cid in clients: qfl_hists[seed][cid] = {"train": {"accuracy": [], "loss": []}}
 
-                    # Label für Logs und Plots erstellen
-                    calib_status = "Calibrated" if use_scale else "Pure"
-                    mode_label = f"{ansatz}_{calib_status}"
+        for r in range(qfl_num_rounds):
+            updates = []
+            for cid in clients:
+                local_m = copy.deepcopy(global_model).to(device)
+                opt = optim.Adam(local_m.parameters(), lr=learning_rate)
+                res = train_client(local_m, client_loaders[cid]['train'], opt, cid, qfl_epochs,
+                                   client_loaders[cid]['val'], device, f"QFL-R{r + 1}")
+                updates.append(res["weights"])
+                qfl_hists[seed][cid]["train"]["accuracy"].extend(res["history"]["train"]["accuracy"])
+                qfl_hists[seed][cid]["train"]["loss"].extend(res["history"]["train"]["loss"])
 
-                    print(f"\n>>> [CLIENT: {client_id}] | ARCH: {ansatz} | MODE: {calib_status} | Seed: {seed}")
+            global_model.load_state_dict(aggregate_models(global_model, updates))
 
-                    # Modell erstellen mit dynamischer Architektur-Wahl
-                    model = QuantumModel(
-                        num_qubits=10,
-                        num_layers=NUM_LAYERS,
-                        use_scaling=use_scale,
-                        ansatz_type=ansatz
-                    ).to(device)
+        for cid in clients:
+            qfl_res[seed][cid] = evaluate_model(global_model, client_loaders[cid]['test'], device)
 
-                    # Optimizer (LR kommt aus config.py)
-                    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-
-                    # --- TRAINING ---
-                    results = train_client(
-                        model=model,
-                        train_loader=client_loaders[client_id]['train'],
-                        optimizer=optimizer,
-                        client_id=client_id,
-                        num_epochs=NUM_EPOCHS,
-                        device=device,
-                        mode_label=mode_label
-                    )
-
-                    # --- EVALUATION ---
-                    print(f"[*] Evaluiere {client_id} auf Test-Set...")
-                    acc, (f1_normal, f1_krank), _, _ = evaluate_model(
-                        model,
-                        client_loaders[client_id]['test'],
-                        device=device
-                    )
-
-                    # Detaillierte Resultat-Ausgabe
-                    print(f"\n[RESULTAT - {mode_label}]")
-                    print(f"Acc: {acc:.2f}% | F1-Normal: {f1_normal:.4f} | F1-Krank: {f1_krank:.4f}")
-
-                    # --- BATCH-ANALYSE (Visualisierung der Rohwerte und Parameter) ---
-                    visualize_batch_analysis(
-                        model=model,
-                        test_loader=client_loaders[client_id]['test'],
-                        client_id=client_id,
-                        mode_label=mode_label,
-                        device=device
-                    )
-
-                    # --- PLOTTING ---
-                    try:
-                        plot_train_accuracy_and_loss_comparative(
-                            train_losses=results["train_losses"],
-                            train_accuracies=results["train_accuracies"],
-                            seed=seed,
-                            client_id=client_id,
-                            mode_label=mode_label
-                        )
-                    except Exception as e:
-                        print(f"[!] Plot-Fehler bei {client_id} ({mode_label}): {e}")
-
-    print("\n" + "█" * header_width)
-    print(f"{' ALLE EXPERIMENTE (4 KONFIGURATIONEN) ERFOLGREICH BEENDET ':^{header_width}}")
-    print("█" * header_width + "\n")
+    run_full_evaluation_suite(qfl_res, base_res, qfl_hists, base_hists, clients, client_loaders, seeds)
 
 
 if __name__ == "__main__":
