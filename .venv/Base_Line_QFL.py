@@ -1,71 +1,110 @@
 import torch
-import torch.optim as optim
-import numpy as np
-import random
+import torch.nn as nn
 import os
-import copy
-
-from config import device, clients, seeds, num_layers, learning_rate, batch_size, qfl_num_rounds, qfl_epochs, \
-    baseline_epochs
+import json
+import time  # Neu für die Zeitmessung
+import config
+from data_prep import get_mnist_binary_loaders
 from Base_Line import QuantumModel
-from train_and_eval import train_client, evaluate_model
-from aggregation_method import aggregate_models
-from data_prep import get_all_client_loaders, print_class_distributions
-from plots import run_full_evaluation_suite
+from train_and_eval import train_model
+from plots import plot_metrics_averaged
+from summarize_results import generate_summary
 
 
-def set_seed(seed):
-    torch.manual_seed(seed);
-    torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed);
-    random.seed(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    torch.backends.cudnn.deterministic = True
+def pad_history(history, max_epochs):
+    """Füllt gekürzte Histories nach Early Stopping auf."""
+    new_history = {}
+    for key in history.keys():
+        values = list(history[key])
+        last_val = values[-1]
+        while len(values) < max_epochs:
+            values.append(last_val)
+        new_history[key] = values
+    return new_history
 
 
 def main():
-    client_loaders = get_all_client_loaders(batch_size=batch_size)
-    print_class_distributions(client_loaders)
+    # Ordner erstellen
+    os.makedirs(config.RESULTS_DIR, exist_ok=True)
 
-    qfl_res, base_res = {s: {} for s in seeds}, {s: {} for s in seeds}
-    qfl_hists, base_hists = {s: {} for s in seeds}, {s: {} for s in seeds}
+    # Daten laden
+    train_loader, val_loader, _ = get_mnist_binary_loaders(batch_size=config.BATCH_SIZE)
 
-    for seed in seeds:
-        print(f"\n{'#' * 60}\n# START SEED {seed}\n{'#' * 60}")
+    # --- Fortschritts-Setup ---
+    total_experiments = (
+                len(config.STUDY_LOSS_MODES) * len(config.STUDY_MEASURE_MODES) * len(config.STUDY_LAYERS) * len(
+            config.STUDY_LRS))
 
-        # BASELINE
-        for cid in clients:
-            set_seed(seed)
-            model = QuantumModel(num_qubits=10, num_layers=num_layers).to(device)
-            opt = optim.Adam(model.parameters(), lr=learning_rate)
+    current_idx = 0
+    start_time_total = time.time()
 
-            res = train_client(model, client_loaders[cid]['train'], opt, cid, baseline_epochs,
-                               client_loaders[cid]['val'], device, "Baseline")
-            base_res[seed][cid] = evaluate_model(model, client_loaders[cid]['test'], device)
-            base_hists[seed][cid] = res["history"]
+    print(f"{'=' * 70}")
+    print(f"STARTE QUANTUM VQC ABLATIONSSTUDIE")
+    print(f"Gesamtanzahl Experimente: {total_experiments} (je {len(config.SEEDS)} Seeds)")
+    print(f"Speicherpfad: {config.RESULTS_DIR}")
+    print(f"{'=' * 70}\n")
 
-        # QFL
-        set_seed(seed)
-        global_model = QuantumModel(num_qubits=10, num_layers=num_layers).to(device)
-        for cid in clients: qfl_hists[seed][cid] = {"train": {"accuracy": [], "loss": []}}
+    for loss_mode in config.STUDY_LOSS_MODES:
+        use_bce = (loss_mode == "BCE")
+        criterion = nn.BCELoss() if use_bce else nn.MSELoss()
 
-        for r in range(qfl_num_rounds):
-            updates = []
-            for cid in clients:
-                local_m = copy.deepcopy(global_model).to(device)
-                opt = optim.Adam(local_m.parameters(), lr=learning_rate)
-                res = train_client(local_m, client_loaders[cid]['train'], opt, cid, qfl_epochs,
-                                   client_loaders[cid]['val'], device, f"QFL-R{r + 1}")
-                updates.append(res["weights"])
-                qfl_hists[seed][cid]["train"]["accuracy"].extend(res["history"]["train"]["accuracy"])
-                qfl_hists[seed][cid]["train"]["loss"].extend(res["history"]["train"]["loss"])
+        for measure_all in config.STUDY_MEASURE_MODES:
+            m_label = "AllQubits" if measure_all else "SingleQubit"
 
-            global_model.load_state_dict(aggregate_models(global_model, updates))
+            for layers in config.STUDY_LAYERS:
+                for lr in config.STUDY_LRS:
+                    current_idx += 1
+                    exp_start_time = time.time()
 
-        for cid in clients:
-            qfl_res[seed][cid] = evaluate_model(global_model, client_loaders[cid]['test'], device)
+                    config_desc = f"{loss_mode} | {m_label} | Layers: {layers} | LR: {lr}"
+                    file_id = f"{loss_mode}_{m_label}_L{layers}_LR{lr}"
 
-    run_full_evaluation_suite(qfl_res, base_res, qfl_hists, base_hists, clients, client_loaders, seeds)
+                    print(f"[{current_idx}/{total_experiments}] Experiment: {file_id}")
+                    print(f"{'-' * 70}")
+
+                    seed_histories = []
+
+                    for seed in config.SEEDS:
+                        print(f"  -> Seed {seed}:")
+                        torch.manual_seed(seed)
+
+                        model = QuantumModel(config.NUM_QUBITS, layers, measure_all, use_bce).to(config.DEVICE)
+                        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+                        # Hier wird nun kompakt (alle 10 Epochen) geprintet
+                        history = train_model(
+                            model, train_loader, val_loader, optimizer,
+                            criterion, config.EPOCHS_PER_EXP, use_bce, config.EARLY_STOPPING_PATIENCE
+                        )
+
+                        seed_histories.append(pad_history(history, config.EPOCHS_PER_EXP))
+
+                    # Nach 5 Seeds: Plotten und Speichern
+                    plot_path = os.path.join(config.RESULTS_DIR, f"{file_id}.png")
+                    plot_metrics_averaged(seed_histories, config_desc, save_path=plot_path)
+
+                    with open(os.path.join(config.RESULTS_DIR, f"{file_id}_data.json"), "w") as f:
+                        json.dump(seed_histories, f)
+
+                    # --- Zeit-Analyse nach jedem Experiment ---
+                    exp_duration = (time.time() - exp_start_time) / 60
+                    elapsed_total_hrs = (time.time() - start_time_total) / 3600
+                    avg_time_per_exp = elapsed_total_hrs / current_idx
+                    remaining_exps = total_experiments - current_idx
+                    est_remaining_hrs = remaining_exps * avg_time_per_exp
+
+                    print(f"\n  [✓] Fertig. Dauer: {exp_duration:.2f} Min")
+                    print(
+                        f"  [i] Fortschritt: {current_idx / total_experiments * 100:.1f}% | Est. Restzeit: {est_remaining_hrs:.2f} Std\n")
+
+    # Finale Zusammenfassung (CSV)
+    print(f"\n{'=' * 70}")
+    print("ALLE EXPERIMENTE BEENDET. GENERIERE ZUSAMMENFASSUNG...")
+    generate_summary(results_dir=config.RESULTS_DIR, output_file=os.path.join(config.RESULTS_DIR, "summary.csv"))
+
+    total_duration_hrs = (time.time() - start_time_total) / 3600
+    print(f"Gesamtdauer: {total_duration_hrs:.2f} Stunden")
+    print(f"{'=' * 70}")
 
 
 if __name__ == "__main__":

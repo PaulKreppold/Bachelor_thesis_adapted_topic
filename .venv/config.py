@@ -1,28 +1,19 @@
 import torch
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-main_clients = ["client_1", "client_2", "client_3"]
-num_subs_per_client = 4
+# Pfad-Konfiguration (Lokal)
+RESULTS_DIR = '/Users/paulkreppold/bachelor_thesis/VQC_ablation_study_AmplitudeEmbedding_on_binary_MNIST'
 
-clients = [f"{main}_sub_{i}" for main in main_clients for i in range(num_subs_per_client)]
-client_qubits = {client: 10 for client in clients}
+# Hyperparameter
+SEEDS = [42]#, 1337, 2024, 7, 101]
+BATCH_SIZE = 32
+NUM_QUBITS = 10
+EPOCHS_PER_EXP = 100
+EARLY_STOPPING_PATIENCE = 12
 
-sub_to_main_mapping = {
-    f"{main}_sub_{i}": main for main in main_clients for i in range(num_subs_per_client)
-}
-
-qfl_num_rounds = 12
-qfl_epochs = 4
-
-seeds = [42, 1337, 2024]
-baseline_epochs = qfl_num_rounds * qfl_epochs
-
-learning_rate = 0.01
-batch_size = 32
-num_layers = 6
-
-
-
-
-
+# Studien-Parameter
+STUDY_LAYERS = [2, 4, 6, 8]
+STUDY_LRS = [0.01, 0.005, 0.001]#, 0.0005, 0.0001]
+STUDY_MEASURE_MODES = [False, True] # False=Single, True=All (Mean)
+STUDY_LOSS_MODES = ["MSE", "BCE"]

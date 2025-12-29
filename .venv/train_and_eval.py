@@ -1,164 +1,79 @@
 import torch
-import torch.nn as nn
-import numpy as np
-from sklearn.metrics import (
-    accuracy_score, f1_score, precision_score, recall_score,
-    roc_auc_score, average_precision_score, confusion_matrix
-)
 
 
-def train_client(model, train_loader, optimizer, client_id, num_epochs, val_loader=None, device="cpu",
-                 mode_label="Baseline"):
+def train_model(model, train_loader, val_loader, optimizer, criterion, epochs, use_bce, patience):
+    history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
 
-    criterion = nn.BCEWithLogitsLoss()
-
-    history = {
-        "train": {
-            "loss": [],
-            "accuracy": [],
-            "f1_normal": [],
-            "f1_krank": []
-        }
-    }
-    if val_loader is not None:
-        history["val"] = {
-            "loss": [],
-            "accuracy": [],
-            "f1_normal": [],
-            "f1_krank": []
-        }
-
-    n_samples = 0
-
-    for epoch in range(num_epochs):
+    for epoch in range(epochs):
         model.train()
-        epoch_losses = []
-        all_preds, all_labels = [], []
+        running_loss, correct, total = 0.0, 0, 0
 
-        for images, labels in train_loader:
-            images = images.to(device)
-            # shape entspricht (Batch, 1)
-            labels = labels.float().view(-1, 1).to(device)
-
+        for inputs, targets in train_loader:
             optimizer.zero_grad()
-            logits = model(images)
-            loss = criterion(logits, labels)
+            outputs = model(inputs)
+
+            if use_bce:
+                t_float = targets.float().view_as(outputs)
+                preds = (outputs >= 0.5).long()
+            else:
+                t_float = targets.float().view_as(outputs) * 2.0 - 1.0
+                preds = (outputs >= 0.0).long()
+
+            loss = criterion(outputs, t_float)
             loss.backward()
             optimizer.step()
 
-            epoch_losses.append(loss.item())
+            correct += (preds.view_as(targets) == targets).sum().item()
+            total += targets.size(0)
+            running_loss += loss.item() * inputs.size(0)
 
-            # Prediction: Logits >= 0.0 -> Klasse 1
-            preds = (logits >= 0.0).float()
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
+        train_loss = running_loss / total
+        train_acc = correct / total
+        val_loss, val_acc = evaluate_model(model, val_loader, criterion, use_bce)
 
-            if epoch == 0:
-                n_samples += labels.size(0)
+        history['train_loss'].append(train_loss)
+        history['train_acc'].append(train_acc)
+        history['val_loss'].append(val_loss)
+        history['val_acc'].append(val_acc)
 
-        all_preds = np.array(all_preds).flatten()
-        all_labels = np.array(all_labels).flatten()
+        # KOMPAKTES LOGGING: Nur alle 10 Epochen ODER in der ersten/letzten Epoche
+        is_last_epoch = (epoch == epochs - 1)
+        if (epoch + 1) % 10 == 0 or epoch == 0 or is_last_epoch:
+            print(
+                f"    Ep [{epoch + 1:02d}/{epochs}] L: {train_loss:.4f} | Val-L: {val_loss:.4f} | Val-A: {val_acc:.3f}")
 
-        train_loss = np.mean(epoch_losses)
-        train_acc = accuracy_score(all_labels, all_preds) * 100.0
-        # F1-Scores pro Klasse [Normal, Krank]
-        train_f1s = f1_score(all_labels, all_preds, labels=[0, 1], average=None, zero_division=0)
+        # Early Stopping Check
+        if val_loss < best_val_loss - 1e-4:
+            best_val_loss = val_loss
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
 
-        history["train"]["loss"].append(train_loss)
-        history["train"]["accuracy"].append(train_acc)
-        history["train"]["f1_normal"].append(train_f1s[0])
-        history["train"]["f1_krank"].append(train_f1s[1])
+        if epochs_no_improve >= patience:
+            # Wenn Early Stopping greift, printen wir den Endstand dieser Runde
+            print(f"    >>> Early Stopping in Ep {epoch + 1} (Best Val-L: {best_val_loss:.4f})")
+            break
 
-        val_str = ""
-        if val_loader is not None:
-            val_metrics = evaluate_model(model, val_loader, device)
-            history["val"]["loss"].append(val_metrics["loss"])
-            history["val"]["accuracy"].append(val_metrics["accuracy"])
-            history["val"]["f1_normal"].append(val_metrics["f1_normal"])
-            history["val"]["f1_krank"].append(val_metrics["f1_krank"])
-
-            val_str = (f" | Val Loss: {val_metrics['loss']:.4f} "
-                       f"| Val Acc: {val_metrics['accuracy']:.2f}% "
-                       f"| Val F1-N: {val_metrics['f1_normal']:.3f}")
-
-        print(
-            f"[{client_id} | {mode_label}] "
-            f"Ep {epoch + 1}/{num_epochs} | "
-            f"Train Loss: {train_loss:.4f} | "
-            f"Train Acc: {train_acc:.2f}%"
-            f"{val_str}"
-        )
-
-    # Gewichte für Aggregation sicher kopieren
-    safe_weights = {
-        k: v.cpu().detach().clone() for k, v in model.state_dict().items()
-    }
-
-    return {
-        "weights": safe_weights,
-        "n_samples": n_samples,
-        "history": history
-    }
+    return history
 
 
-def evaluate_model(model, loader, device="cpu"):
-
-    # Berechnet Metriken zur Analyse von Label Skew (F1 pro Klasse, Precision, Recall, AUC)
+def evaluate_model(model, data_loader, criterion, use_bce):
     model.eval()
-    criterion = nn.BCEWithLogitsLoss()
-
-    total_loss = 0.0
-    all_logits, all_labels = [], []
-
+    running_loss, correct, total = 0.0, 0, 0
     with torch.no_grad():
-        for images, labels in loader:
-            images = images.to(device)
-            labels = labels.float().view(-1, 1).to(device)
+        for inputs, targets in data_loader:
+            outputs = model(inputs)
+            if use_bce:
+                t_float = targets.float().view_as(outputs)
+                preds = (outputs >= 0.5).long()
+            else:
+                t_float = targets.float().view_as(outputs) * 2.0 - 1.0
+                preds = (outputs >= 0.0).long()
 
-            logits = model(images)
-            loss = criterion(logits, labels)
-
-            total_loss += loss.item() * labels.size(0)
-            all_logits.append(logits.cpu())
-            all_labels.append(labels.cpu())
-
-    # Zusammenführen der Batches
-    all_logits = torch.cat(all_logits).numpy().flatten()
-    all_labels = torch.cat(all_labels).numpy().flatten()
-
-    # Wahrscheinlichkeiten (Sigmoid) und binäre prediction
-    probs = 1 / (1 + np.exp(-all_logits))
-    preds = (all_logits >= 0.0).astype(float)
-
-    avg_loss = total_loss / len(all_labels)
-
-    # F1 pro Klasse
-    f1_per_class = f1_score(all_labels, preds, labels=[0, 1], average=None, zero_division=0)
-
-    # Prüfung auf mehrere Klassen für AUC
-    unique_labels = len(np.unique(all_labels))
-
-    metrics = {
-        "loss": avg_loss,
-        "accuracy": accuracy_score(all_labels, preds) * 100.0,
-
-        "f1_macro": f1_score(all_labels, preds, average="macro", zero_division=0),
-        "f1_normal": float(f1_per_class[0]),
-        "f1_krank": float(f1_per_class[1]),
-
-        "precision_normal": precision_score(all_labels, preds, pos_label=0, zero_division=0),
-        "precision_krank": precision_score(all_labels, preds, pos_label=1, zero_division=0),
-        "recall_normal": recall_score(all_labels, preds, pos_label=0, zero_division=0),
-        "recall_krank": recall_score(all_labels, preds, pos_label=1, zero_division=0),
-
-        # AUC-Metriken (Sensibel für Konfidenz)
-        "auc_roc": roc_auc_score(all_labels, probs) if unique_labels > 1 else np.nan,
-        "auc_pr": average_precision_score(all_labels, probs) if unique_labels > 1 else np.nan,
-
-        "confusion_matrix": confusion_matrix(all_labels, preds, labels=[0, 1]),
-
-        "probs": probs,
-        "labels": all_labels
-    }
-
-    return metrics
+            loss = criterion(outputs, t_float)
+            running_loss += loss.item() * inputs.size(0)
+            correct += (preds.view_as(targets) == targets).sum().item()
+            total += targets.size(0)
+    return running_loss / total, correct / total
