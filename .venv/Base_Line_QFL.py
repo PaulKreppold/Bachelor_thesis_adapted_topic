@@ -1,111 +1,122 @@
 import torch
-import torch.nn as nn
 import os
-import json
-import time  # Neu für die Zeitmessung
-import config
-from data_prep import get_mnist_binary_loaders
+import numpy as np
+import config  # Importiert SEEDS, BATCH_SIZE, NUM_QUBITS, NUM_LAYERS, LR, etc.
+from data_prep import get_pneumonia_mnist_loaders
 from Base_Line import QuantumModel
-from train_and_eval import train_model
-from plots import plot_metrics_averaged
-from summarize_results import generate_summary
-
-
-def pad_history(history, max_epochs):
-    """Füllt gekürzte Histories nach Early Stopping auf."""
-    new_history = {}
-    for key in history.keys():
-        values = list(history[key])
-        last_val = values[-1]
-        while len(values) < max_epochs:
-            values.append(last_val)
-        new_history[key] = values
-    return new_history
-
+from train_and_eval import train_model, evaluate_model
+from plots import plot_averaged_results, plot_test_accuracy_distribution
 
 def main():
-    # Ordner erstellen
+    # 0. Vorbereitung
     os.makedirs(config.RESULTS_DIR, exist_ok=True)
+    summary_file_path = os.path.join(config.RESULTS_DIR, "final_summary.txt")
 
-    # Daten laden
-    train_loader, val_loader, _ = get_mnist_binary_loaders(batch_size=config.BATCH_SIZE)
+    # 1. Daten laden (Gibt train, val und test loader zurück)
+    train_loader, val_loader, test_loader = get_pneumonia_mnist_loaders(batch_size=config.BATCH_SIZE)
 
-    # --- Fortschritts-Setup ---
-    total_experiments = (
-                len(config.STUDY_LOSS_MODES) * len(config.STUDY_MEASURE_MODES) * len(config.STUDY_LAYERS) * len(
-            config.STUDY_LRS))
+    all_histories = []
+    test_results = []
 
-    current_idx = 0
-    start_time_total = time.time()
+    print(f"{'=' * 75}")
+    print(f"STARTE QUANTUM VQC RUN")
+    print(f"Datensatz: PneumoniaMNIST")
+    print(f"Device: {config.DEVICE} | Epochs: {config.NUM_EPOCHS} | Seeds: {len(config.SEEDS)}")
+    print(f"Konfiguration: {config.NUM_QUBITS} Qubits, {config.NUM_LAYERS} Layers, LR: {config.LR}")
+    print(f"{'=' * 75}\n")
 
-    print(f"{'=' * 70}")
-    print(f"STARTE QUANTUM VQC ABLATIONSSTUDIE")
-    print(f"Gesamtanzahl Experimente: {total_experiments} (je {len(config.SEEDS)} Seeds)")
-    print(f"Speicherpfad: {config.RESULTS_DIR}")
-    print(f"{'=' * 70}\n")
+    # 2. Schleife über die konfigurierten Seeds
+    for i, seed in enumerate(config.SEEDS):
+        print(f"--- [SEED {i + 1}/{len(config.SEEDS)}: {seed}] ---")
 
-    for loss_mode in config.STUDY_LOSS_MODES:
-        use_bce = (loss_mode == "BCE")
-        criterion = nn.BCELoss() if use_bce else nn.MSELoss()
+        # Reproduzierbarkeit
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
 
-        for measure_all in config.STUDY_MEASURE_MODES:
-            m_label = "AllQubits" if measure_all else "SingleQubit"
+        # Modell, Optimizer & Criterion
+        model = QuantumModel(
+            num_qubits=config.NUM_QUBITS,
+            num_layers=config.NUM_LAYERS
+        ).to(config.DEVICE)
 
-            for layers in config.STUDY_LAYERS:
-                for lr in config.STUDY_LRS:
-                    current_idx += 1
-                    exp_start_time = time.time()
+        optimizer = torch.optim.Adam(model.parameters(), lr=config.LR)
+        criterion = torch.nn.MSELoss()
 
-                    config_desc = f"{loss_mode} | {m_label} | Layers: {layers} | LR: {lr}"
-                    file_id = f"{loss_mode}_{m_label}_L{layers}_LR{lr}"
+        # Training
+        history, final_val_cm = train_model(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            optimizer=optimizer,
+            criterion=criterion,
+            epochs=config.NUM_EPOCHS,
+            seed=seed,
+            device=config.DEVICE
+        )
+        all_histories.append(history)
 
-                    print(f"[{current_idx}/{total_experiments}] Experiment: {file_id}")
-                    print(f"{'-' * 70}")
+        # Test-Evaluation (Unseen Data)
+        test_loss, test_acc, test_cm = evaluate_model(model, test_loader, criterion, config.DEVICE)
+        test_results.append({'loss': test_loss, 'acc': test_acc, 'cm': test_cm})
 
-                    seed_histories = []
+        # --- AUSGABE DER CONFUSION MATRIX FÜR DIESEN SEED ---
+        print(f"\n[Seed {seed}] Ergebnisse:")
+        print(f"Test-Acc: {test_acc * 100:.2f}%")
+        print(f"Confusion Matrix (Test):")
+        print(f"   TN: {test_cm[0, 0]:4d} | FP: {test_cm[0, 1]:4d}")
+        print(f"   FN: {test_cm[1, 0]:4d} | TP: {test_cm[1, 1]:4d}")
+        print("-" * 30 + "\n")
 
-                    for seed in config.SEEDS:
-                        print(f"  -> Seed {seed}:")
-                        torch.manual_seed(seed)
+    # 3. Statistische Auswertung berechnen
+    f_train_acc = [h['acc'][-1] for h in all_histories]
+    f_val_acc = [h['val_acc'][-1] for h in all_histories]
+    f_test_acc = [r['acc'] for r in test_results]
+    f_test_loss = [r['loss'] for r in test_results]
 
-                        model = QuantumModel(config.NUM_QUBITS, layers, measure_all, use_bce).to(config.DEVICE)
-                        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    # Durchschnittliche CM über alle Seeds berechnen
+    all_test_cms = np.array([r['cm'] for r in test_results])
+    mean_cm = np.mean(all_test_cms, axis=0)
 
-                        # Hier wird nun kompakt (alle 10 Epochen) geprintet
-                        history = train_model(
-                            model, train_loader, val_loader, optimizer,
-                            criterion, config.EPOCHS_PER_EXP, use_bce, config.EARLY_STOPPING_PATIENCE
-                        )
+    def calc_stats(data):
+        return np.mean(data), np.std(data)
 
-                        seed_histories.append(pad_history(history, config.EPOCHS_PER_EXP))
+    stats = {
+        "Train Acc": calc_stats(f_train_acc),
+        "Val Acc":   calc_stats(f_val_acc),
+        "Test Loss": calc_stats(f_test_loss),
+        "Test Acc":  calc_stats(f_test_acc),
+    }
 
-                    # Nach 5 Seeds: Plotten und Speichern
-                    plot_path = os.path.join(config.RESULTS_DIR, f"{file_id}.png")
-                    plot_metrics_averaged(seed_histories, config_desc, save_path=plot_path)
+    # 4. Ergebnisausgabe & Speichern
+    output_str = (
+        f"{'=' * 75}\n"
+        f"FINALE ERGEBNISSE (Mittelwert ± Standardabweichung)\n"
+        f"{'=' * 75}\n"
+        f"Train Accuracy:  {stats['Train Acc'][0] * 100:.2f}% ± {stats['Train Acc'][1] * 100:.2f}%\n"
+        f"Val Accuracy:    {stats['Val Acc'][0] * 100:.2f}% ± {stats['Val Acc'][1] * 100:.2f}%\n"
+        f"{'-' * 75}\n"
+        f"TEST LOSS:       {stats['Test Loss'][0]:.4f} ± {stats['Test Loss'][1]:.4f}\n"
+        f"TEST ACCURACY:   {stats['Test Acc'][0] * 100:.2f}% ± {stats['Test Acc'][1] * 100:.2f}%\n\n"
+        f"DURCHSCHNITTLICHE TEST CONFUSION MATRIX:\n"
+        f"   TN: {mean_cm[0, 0]:6.1f} | FP: {mean_cm[0, 1]:6.1f}\n"
+        f"   FN: {mean_cm[1, 0]:6.1f} | TP: {mean_cm[1, 1]:6.1f}\n"
+        f"{'=' * 75}\n"
+    )
 
-                    with open(os.path.join(config.RESULTS_DIR, f"{file_id}_data.json"), "w") as f:
-                        json.dump(seed_histories, f)
+    print(output_str)
 
-                    # --- Zeit-Analyse nach jedem Experiment ---
-                    exp_duration = (time.time() - exp_start_time) / 60
-                    elapsed_total_hrs = (time.time() - start_time_total) / 3600
-                    avg_time_per_exp = elapsed_total_hrs / current_idx
-                    remaining_exps = total_experiments - current_idx
-                    est_remaining_hrs = remaining_exps * avg_time_per_exp
+    with open(summary_file_path, "w") as f:
+        f.write(output_str)
 
-                    print(f"\n  [✓] Fertig. Dauer: {exp_duration:.2f} Min")
-                    print(
-                        f"  [i] Fortschritt: {current_idx / total_experiments * 100:.1f}% | Est. Restzeit: {est_remaining_hrs:.2f} Std\n")
+    # 5. Visualisierung
+    print("Erstelle Plots...")
+    plot_test_accuracy_distribution(f_test_acc, config.RESULTS_DIR)
+    plot_averaged_results(all_histories, config.RESULTS_DIR)
 
-    # Finale Zusammenfassung (CSV)
-    print(f"\n{'=' * 70}")
-    print("ALLE EXPERIMENTE BEENDET. GENERIERE ZUSAMMENFASSUNG...")
-    generate_summary(results_dir=config.RESULTS_DIR, output_file=os.path.join(config.RESULTS_DIR, "summary.csv"))
+    print(f"Alles erledigt. Ergebnisse gespeichert unter: {config.RESULTS_DIR}")
 
-    total_duration_hrs = (time.time() - start_time_total) / 3600
-    print(f"Gesamtdauer: {total_duration_hrs:.2f} Stunden")
-    print(f"{'=' * 70}")
-
-
+# Der fehlende Aufruf:
 if __name__ == "__main__":
     main()

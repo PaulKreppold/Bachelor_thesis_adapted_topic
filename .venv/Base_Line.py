@@ -1,48 +1,46 @@
+import pennylane as qml
 import torch
 import torch.nn as nn
-import pennylane as qml
 
 
 class QuantumModel(nn.Module):
-    def __init__(self, num_qubits=10, num_layers=2, measure_all=False, use_bce=False):
+    def __init__(self, num_qubits=6, num_layers=4):
         super().__init__()
         self.num_qubits = num_qubits
         self.num_layers = num_layers
-        self.measure_all = measure_all
-        self.use_bce = use_bce
-        self.dev = qml.device("default.qubit", wires=num_qubits)
-        self.weight_shapes = {"weights": (num_layers, num_qubits, 2)}
 
-        @qml.qnode(self.dev, interface="torch")
+        dev = qml.device("default.qubit", wires=num_qubits)
+
+        # NEU: Nur 1 Parameter (RY) pro Qubit pro Layer
+        self.weight_shapes = {"weights": (num_layers, num_qubits)}
+
+        @qml.qnode(dev, interface="torch")
         def circuit(inputs, weights):
-            qml.AmplitudeEmbedding(features=inputs, wires=range(self.num_qubits), pad_with=0.0, normalize=True)
-            for layer in range(self.num_layers):
-                for i in range(self.num_qubits):
-                    qml.RY(weights[layer, i, 0], wires=i)
-                    qml.RZ(weights[layer, i, 1], wires=i)
-                # Circular CNOT Ring (Verschränkung)
-                for i in range(self.num_qubits):
-                    qml.CNOT(wires=[i, (i + 1) % self.num_qubits])
+            qml.AmplitudeEmbedding(inputs, wires=range(self.num_qubits), normalize=True)
 
-            if self.measure_all:
-                return [qml.expval(qml.PauliZ(i)) for i in range(self.num_qubits)]
-            else:
-                return qml.expval(qml.PauliZ(0))
+            for l in range(self.num_layers):
+                # 1. Rotations-Schicht
+                for i in range(self.num_qubits):
+                    qml.RY(weights[l, i], wires=i)
+
+                # 2. Verschränkungs-Schicht (Ring-Struktur)
+                if self.num_qubits > 1:
+                    for i in range(self.num_qubits):
+                        qml.CNOT(wires=[i, (i + 1) % self.num_qubits])
+
+            return qml.expval(qml.PauliZ(0))
 
         self.qlayer = qml.qnn.TorchLayer(circuit, self.weight_shapes)
 
-        # --- INITIALISIERUNG: Kleine Gewichte gegen Barren Plateaus ---
-        torch.nn.init.uniform_(self.qlayer.weights, a=-0.01, b=0.01)
+        # WICHTIG: Initialisierung näher bei 0
+        nn.init.normal_(self.qlayer.weights, mean=0.0, std=0.1)
 
     def forward(self, x):
-        x = x.view(x.size(0), -1)
+        # Flattening: (Batch, 1, 8, 8) -> (Batch, 64)
+        x = x.view(-1, 64)
+
+        # Quantum Layer Output
         q_out = self.qlayer(x)
 
-        if self.measure_all:
-            q_out = torch.mean(q_out, dim=1, keepdim=True)
-        else:
-            q_out = q_out.view(-1, 1)
-
-        if self.use_bce:
-            return torch.sigmoid(q_out)  # Wichtig für BCELoss
-        return q_out
+        # Shape Anpassung für MSE [Batch, 1]
+        return q_out.unsqueeze(1)
