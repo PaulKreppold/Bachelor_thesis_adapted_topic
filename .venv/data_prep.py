@@ -9,7 +9,7 @@ def get_pneumonia_mnist_loaders(batch_size=32, val_split=0.1):
     info = INFO[data_flag]
     DataClass = getattr(medmnist, info['python_class'])
 
-    # Transform-Pipeline (Resize auf 8x8 = 64 Features -> 6 Qubits)
+
     transform = transforms.Compose([
         transforms.Resize((8, 8)),
         transforms.ToTensor(),

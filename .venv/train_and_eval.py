@@ -1,10 +1,12 @@
 import torch
-
+import numpy as np
 from sklearn.metrics import confusion_matrix
-import seaborn as sns
 
 
 def train_model(model, train_loader, val_loader, optimizer, criterion, epochs, seed, device):
+    """
+    Trainiert das VQC-Modell unter Verwendung von BCEWithLogitsLoss.
+    """
     history = {'loss': [], 'acc': [], 'val_loss': [], 'val_acc': []}
     final_cm = None
 
@@ -13,16 +15,23 @@ def train_model(model, train_loader, val_loader, optimizer, criterion, epochs, s
         running_loss, correct, total = 0.0, 0, 0
 
         for inputs, targets in train_loader:
+            # Inputs auf Device laden, Targets als Float [Batch, 1] für BCE
             inputs, targets = inputs.to(device), targets.to(device).float().view(-1, 1)
-            targets_mapped = 2 * targets - 1
 
             optimizer.zero_grad()
+
+            # Forward Pass: Liefert Logits im Bereich ca. [-1, 1] (aufgrund der PauliZ Messung)
             outputs = model(inputs)
-            loss = criterion(outputs, targets_mapped)
+
+            # BCEWithLogitsLoss erwartet Logits und Targets in [0, 1]
+            loss = criterion(outputs, targets)
+
             loss.backward()
             optimizer.step()
 
+            # Klassifizierung: Logit > 0 entspricht Klasse 1 (P > 0.5)
             preds = (outputs > 0).float()
+
             correct += (preds == targets).sum().item()
             total += targets.size(0)
             running_loss += loss.item() * inputs.size(0)
@@ -52,6 +61,7 @@ def train_model(model, train_loader, val_loader, optimizer, criterion, epochs, s
 def evaluate_model(model, data_loader, criterion, device):
     """
     Evaluiert das Modell und gibt Loss, Acc und Confusion Matrix zurück.
+    Optimiert für Logit-Outputs und BCE-Kriterien.
     """
     model.eval()
     running_loss, correct, total = 0.0, 0, 0
@@ -63,14 +73,15 @@ def evaluate_model(model, data_loader, criterion, device):
         for inputs, targets in data_loader:
             inputs, targets = inputs.to(device), targets.to(device).float().view(-1, 1)
 
-            # Mapping von [0, 1] auf [-1, 1] für den Loss
-            targets_mapped = 2 * targets - 1
+            # Forward Pass (Logits)
             outputs = model(inputs)
-            loss = criterion(outputs, targets_mapped)
+
+            # Loss Berechnung (direkt mit Targets in [0, 1])
+            loss = criterion(outputs, targets)
 
             running_loss += loss.item() * inputs.size(0)
 
-            # Vorhersage: Klasse 1 wenn > 0, sonst Klasse 0
+            # Vorhersage: Logit > 0 -> Klasse 1, sonst Klasse 0
             preds = (outputs > 0).float()
 
             # Für Metriken sammeln
@@ -83,7 +94,7 @@ def evaluate_model(model, data_loader, criterion, device):
     avg_loss = running_loss / total
     avg_acc = correct / total
 
-    # Confusion Matrix berechnen (0 = Negative, 1 = Positive)
+    # Confusion Matrix berechnen
     cm = confusion_matrix(all_targets, all_preds, labels=[0, 1])
 
     return avg_loss, avg_acc, cm
