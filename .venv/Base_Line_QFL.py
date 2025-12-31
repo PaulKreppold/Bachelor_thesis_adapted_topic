@@ -2,25 +2,30 @@ import torch
 import os
 import numpy as np
 import config  # Importiert SEEDS, BATCH_SIZE, NUM_QUBITS, NUM_LAYERS, LR, etc.
-from data_prep import get_pneumonia_mnist_loaders
+from data_prep import get_pca_data_loaders
 from Base_Line import QuantumModel
 from train_and_eval import train_model, evaluate_model
 from plots import plot_averaged_results, plot_test_accuracy_distribution
 
+
 def main():
-    # 0. Vorbereitung
+    # 0. Vorbereitung & Verzeichnisse
     os.makedirs(config.RESULTS_DIR, exist_ok=True)
     summary_file_path = os.path.join(config.RESULTS_DIR, "final_summary.txt")
 
-    # 1. Daten laden (Gibt train, val und test loader zurück)
-    train_loader, val_loader, test_loader = get_pneumonia_mnist_loaders(batch_size=config.BATCH_SIZE)
+    # 1. Daten laden (PCA wird hier einmalig initialisiert)
+    # n_components=20 für 10 Qubits (Dense Angle Encoding)
+    train_loader, val_loader, test_loader = get_pca_data_loaders(
+        batch_size=config.BATCH_SIZE,
+        n_components=config.NUM_FEATURES
+    )
 
     all_histories = []
     test_results = []
 
     print(f"{'=' * 75}")
-    print(f"STARTE QUANTUM VQC RUN")
-    print(f"Datensatz: PneumoniaMNIST")
+    print(f"STARTE QUANTUM VQC RUN (PCA + DENSE ENCODING)")
+    print(f"Datensatz: PneumoniaMNIST | Features: {config.NUM_FEATURES} (PCA)")
     print(f"Device: {config.DEVICE} | Epochs: {config.NUM_EPOCHS} | Seeds: {len(config.SEEDS)}")
     print(f"Konfiguration: {config.NUM_QUBITS} Qubits, {config.NUM_LAYERS} Layers, LR: {config.LR}")
     print(f"{'=' * 75}\n")
@@ -29,13 +34,13 @@ def main():
     for i, seed in enumerate(config.SEEDS):
         print(f"--- [SEED {i + 1}/{len(config.SEEDS)}: {seed}] ---")
 
-        # Reproduzierbarkeit
+        # Reproduzierbarkeit sicherstellen
         torch.manual_seed(seed)
         np.random.seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
 
-        # Modell, Optimizer & Criterion
+        # Modell, Optimizer & Criterion initialisieren
         model = QuantumModel(
             num_qubits=config.NUM_QUBITS,
             num_layers=config.NUM_LAYERS
@@ -44,8 +49,8 @@ def main():
         optimizer = torch.optim.Adam(model.parameters(), lr=config.LR)
         criterion = torch.nn.MSELoss()
 
-        # Training
-        history, final_val_cm = train_model(
+        # Training (gibt history zurück)
+        history = train_model(
             model=model,
             train_loader=train_loader,
             val_loader=val_loader,
@@ -57,11 +62,15 @@ def main():
         )
         all_histories.append(history)
 
-        # Test-Evaluation (Unseen Data)
+        # Test-Evaluation auf ungesehenen Daten
         test_loss, test_acc, test_cm = evaluate_model(model, test_loader, criterion, config.DEVICE)
-        test_results.append({'loss': test_loss, 'acc': test_acc, 'cm': test_cm})
+        test_results.append({
+            'loss': test_loss,
+            'acc': test_acc,
+            'cm': test_cm
+        })
 
-        # --- AUSGABE DER CONFUSION MATRIX FÜR DIESEN SEED ---
+        # Einzelausgabe für den aktuellen Seed
         print(f"\n[Seed {seed}] Ergebnisse:")
         print(f"Test-Acc: {test_acc * 100:.2f}%")
         print(f"Confusion Matrix (Test):")
@@ -69,13 +78,13 @@ def main():
         print(f"   FN: {test_cm[1, 0]:4d} | TP: {test_cm[1, 1]:4d}")
         print("-" * 30 + "\n")
 
-    # 3. Statistische Auswertung berechnen
+    # 3. Statistische Auswertung über alle Seeds
     f_train_acc = [h['acc'][-1] for h in all_histories]
     f_val_acc = [h['val_acc'][-1] for h in all_histories]
     f_test_acc = [r['acc'] for r in test_results]
     f_test_loss = [r['loss'] for r in test_results]
 
-    # Durchschnittliche CM über alle Seeds berechnen
+    # Durchschnittliche Confusion Matrix berechnen
     all_test_cms = np.array([r['cm'] for r in test_results])
     mean_cm = np.mean(all_test_cms, axis=0)
 
@@ -84,15 +93,15 @@ def main():
 
     stats = {
         "Train Acc": calc_stats(f_train_acc),
-        "Val Acc":   calc_stats(f_val_acc),
+        "Val Acc": calc_stats(f_val_acc),
         "Test Loss": calc_stats(f_test_loss),
-        "Test Acc":  calc_stats(f_test_acc),
+        "Test Acc": calc_stats(f_test_acc),
     }
 
-    # 4. Ergebnisausgabe & Speichern
+    # 4. Zusammenfassung formatieren und speichern
     output_str = (
         f"{'=' * 75}\n"
-        f"FINALE ERGEBNISSE (Mittelwert ± Standardabweichung)\n"
+        f"FINALE ERGEBNISSE: PCA-Dense-VQC (Mittelwert ± StdAbw)\n"
         f"{'=' * 75}\n"
         f"Train Accuracy:  {stats['Train Acc'][0] * 100:.2f}% ± {stats['Train Acc'][1] * 100:.2f}%\n"
         f"Val Accuracy:    {stats['Val Acc'][0] * 100:.2f}% ± {stats['Val Acc'][1] * 100:.2f}%\n"
@@ -110,13 +119,17 @@ def main():
     with open(summary_file_path, "w") as f:
         f.write(output_str)
 
-    # 5. Visualisierung
-    print("Erstelle Plots...")
+    # 5. Visualisierung mit deinen bestehenden Funktionen
+    print("Erstelle Visualisierungen...")
+
+    # Deine Funktion für die Verteilung der Test-Accuracies
     plot_test_accuracy_distribution(f_test_acc, config.RESULTS_DIR)
+
+    # Deine Funktion für die gemittelten Lernkurven (Loss & Acc)
     plot_averaged_results(all_histories, config.RESULTS_DIR)
 
-    print(f"Alles erledigt. Ergebnisse gespeichert unter: {config.RESULTS_DIR}")
+    print(f"\nProzess abgeschlossen. Alle Ergebnisse und Plots unter: {config.RESULTS_DIR}")
 
-# Der fehlende Aufruf:
+
 if __name__ == "__main__":
     main()

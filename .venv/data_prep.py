@@ -3,37 +3,67 @@ from torch.utils.data import DataLoader, Subset, random_split
 from torchvision import transforms
 import medmnist
 from medmnist import INFO
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import MinMaxScaler
+import numpy as np
 
-def get_pneumonia_mnist_loaders(batch_size=32, val_split=0.1):
+
+# ==========================================
+# 2. DATA PREPARATION (inkl. PCA)
+# ==========================================
+def get_pca_data_loaders(batch_size=32, val_split=0.1, n_components=20):
     data_flag = 'pneumoniamnist'
     info = INFO[data_flag]
     DataClass = getattr(medmnist, info['python_class'])
 
-    # Transform-Pipeline (Resize auf 8x8 = 64 Features -> 6 Qubits)
     transform = transforms.Compose([
-        transforms.Resize((8, 8)),
+        transforms.Resize((28, 28)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[.5], std=[.5]) # Empfohlen für MedMNIST
+        transforms.Normalize(mean=[.5], std=[.5])
     ])
 
     # Datensätze laden
-    # MedMNIST hat bereits vordefinierte Splits (train, val, test)
-    # Wir laden hier train und test und bauen den val-split wie gewünscht manuell
-    train_dataset = DataClass(split='train', transform=transform, download=True)
+    full_train_dataset = DataClass(split='train', transform=transform, download=True)
     test_dataset = DataClass(split='test', transform=transform, download=True)
 
-    # Da PneumoniaMNIST bereits binär ist, brauchen wir kein get_binary_indices!
-    # Wir nutzen den vordefinierten Trainingssatz und splitten ihn in Train/Val
-    val_size = int(len(train_dataset) * val_split)
-    train_size = len(train_dataset) - val_size
+    # Hilfsfunktion zum Extrahieren von flachen Arrays für PCA
+    def extract_raw_data(dataset):
+        loader = DataLoader(dataset, batch_size=len(dataset))
+        images, targets = next(iter(loader))
+        return images.view(len(dataset), -1).numpy(), targets.numpy()
 
+    # Rohdaten extrahieren
+    x_train_raw, y_train_raw = extract_raw_data(full_train_dataset)
+    x_test_raw, y_test_raw = extract_raw_data(test_dataset)
+
+    # PCA Fitting (nur auf Training!)
+    pca = PCA(n_components=n_components)
+    scaler = MinMaxScaler(feature_range=(0, np.pi))
+
+    x_train_pca = pca.fit_transform(x_train_raw)
+    x_train_scaled = scaler.fit_transform(x_train_pca)
+
+    x_test_pca = pca.transform(x_test_raw)
+    x_test_scaled = scaler.transform(x_test_pca)
+
+    # Zurück in PyTorch Tensoren wandeln
+    train_tensor = torch.utils.data.TensorDataset(
+        torch.FloatTensor(x_train_scaled), torch.LongTensor(y_train_raw)
+    )
+    test_loader = DataLoader(
+        torch.utils.data.TensorDataset(torch.FloatTensor(x_test_scaled), torch.LongTensor(y_test_raw)),
+        batch_size=batch_size, shuffle=False
+    )
+
+    # Train/Val Split
+    val_size = int(len(train_tensor) * val_split)
+    train_size = len(train_tensor) - val_size
     train_subset, val_subset = random_split(
-        train_dataset, [train_size, val_size],
+        train_tensor, [train_size, val_size],
         generator=torch.Generator().manual_seed(42)
     )
 
     train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
     return train_loader, val_loader, test_loader

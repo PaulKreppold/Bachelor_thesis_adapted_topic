@@ -34,7 +34,7 @@ def plot_averaged_results(all_histories, save_dir):
 
 def plot_test_accuracy_distribution(test_accs, results_dir):
     """
-    Erstellt einen Boxplot der Test-Accuracy über alle Seeds.
+    Erstellt einen Boxplot der Test-Accuracy über alle Seeds im Stil von arXiv:2402.09902.
     test_accs: Liste von Floats (0.0 bis 1.0)
     """
     plt.figure(figsize=(6, 8))
@@ -43,13 +43,21 @@ def plot_test_accuracy_distribution(test_accs, results_dir):
     data = [acc * 100 for acc in test_accs]
 
     # Style-Einstellungen
-    sns.set_theme(style="whitegrid")
+    sns.set_theme(style="whitegrid", rc={"axes.grid.axis": "y"}) # Nur horizontaler Grid
 
     # Boxplot erstellen
-    sns.boxplot(y=data, color="#a3c1ad", width=0.5)
+    sns.boxplot(
+        y=data,
+        width=0.5,
+        patch_artist=True, # Ermöglicht das Füllen der Box
+        boxprops=dict(facecolor='#a3c1ad', edgecolor='black', linewidth=1.5), # Füllfarbe, schwarzer Rand
+        whiskerprops=dict(color='black', linewidth=1.5), # Schwarze Whisker
+        capprops=dict(color='black', linewidth=1.5), # Schwarze Kappen
+        medianprops=dict(color='black', linewidth=2) # Schwarze, dickere Medianlinie
+    )
 
     # Einzelne Punkte (Seeds) darüber legen für maximale Transparenz
-    sns.stripplot(y=data, color="#2a4d34", size=8, jitter=True, edgecolor="black", linewidth=1)
+    sns.stripplot(y=data, color="#2a4d34", size=6, jitter=True, edgecolor="black", linewidth=1)
 
     plt.title("Verteilung der Test-Accuracy über alle Seeds", fontsize=14, pad=20)
     plt.ylabel("Accuracy (%)", fontsize=12)
