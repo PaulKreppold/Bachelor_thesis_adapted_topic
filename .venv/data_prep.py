@@ -19,7 +19,6 @@ def get_pca_data_loaders(batch_size=32, val_split=0.1, n_components=20):
     transform = transforms.Compose([
         transforms.Resize((28, 28)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[.5], std=[.5])
     ])
 
     # Datensätze laden
