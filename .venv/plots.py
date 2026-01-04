@@ -156,3 +156,54 @@ def visualize_top_errors(log_file_path, raw_dataset, num_samples=3, save_path=No
     if save_path: plt.savefig(save_path, dpi=300)
     plt.close()
 
+
+def analyze_batch_uncertainty(model, loader, device, save_dir, stage="initial", seed=None):
+    """
+    Analysiert den ersten Batch auf Unsicherheit und speichert Tabelle + Plot inkl. Seed-Info.
+    """
+    model.eval()
+    inputs, targets = next(iter(loader))
+    inputs = inputs.to(device)
+    targets_float = targets.view(-1, 1).float().to(device)
+
+    with torch.no_grad():
+        outputs = model(inputs)
+        loss_fn = nn.BCELoss(reduction='none')
+        individual_losses = loss_fn(outputs, targets_float)
+
+    outputs_np = outputs.cpu().numpy().flatten()
+    targets_np = targets.cpu().numpy().flatten()
+    losses_np = individual_losses.cpu().numpy().flatten()
+
+    # DataFrame erstellen und SEED hinzufügen
+    df = pd.DataFrame({
+        'Seed': [seed] * len(inputs),  # Neue Spalte für den Seed
+        'ID': range(len(inputs)),
+        'Pred': outputs_np,
+        'GT': targets_np,
+        'Loss': losses_np,
+        'Dist_0.5': np.abs(outputs_np - 0.5)
+    }).sort_values(by='Dist_0.5')
+
+    # Dateiname enthält nun auch den Seed zur eindeutigen Identifizierung
+    csv_filename = f"uncertainty_{stage}_seed_{seed}.csv"
+    df.to_csv(os.path.join(save_dir, csv_filename), index=False)
+
+    # Plotting mit Seed im Titel
+    plt.figure(figsize=(10, 5))
+    sns.stripplot(x=outputs_np, y=targets_np.astype(str), hue=targets_np,
+                  palette={0: 'blue', 1: 'red'}, jitter=0.1, alpha=0.7, orient='h', order=['0', '1'])
+
+    plt.axvline(x=0.5, color='black', linestyle='--')
+    plt.axvspan(0.4, 0.6, color='yellow', alpha=0.1)
+
+    plt.title(f"Unsicherheits-Analyse ({stage.upper()}) | Seed: {seed}")
+    plt.xlabel("Vorhersage Wahrscheinlichkeit (Pneumonie)")
+    plt.ylabel("Ground Truth Label")
+    plt.xlim(-0.05, 1.05)
+    plt.grid(True, alpha=0.2)
+    plt.tight_layout()
+
+    plot_filename = f"uncertainty_plot_{stage}_seed_{seed}.png"
+    plt.savefig(os.path.join(save_dir, plot_filename))
+    plt.close()

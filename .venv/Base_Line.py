@@ -3,91 +3,59 @@ import torch.nn as nn
 import pennylane as qml
 
 
-class QuantumModel(nn.Module):
-    def __init__(self, num_qubits=6, num_layers=6, encoding="angle", use_scaling=True):
+class QuantumModelDRU(nn.Module):
+    def __init__(self, num_qubits=6, num_features=48, layers_per_block=1):
         """
-        Variational Quantum Classifier (VQC)
+        Reiner Variational Quantum Classifier (VQC) mit Data Re-Uploading.
+        Ohne klassische Skalierungsparameter.
 
         Args:
-            num_qubits (int): Anzahl der Qubits (standardmäßig 6).
-            num_layers (int): Tiefe des Variational Circuits.
-            encoding (str): "angle" für Dense Angle Encoding oder "iqp" für IQP-style Mapping.
-            use_scaling (bool): Wenn True, werden lernbare Scale- und Bias-Parameter hinzugefügt.
+            num_qubits (int): Anzahl der Qubits (6).
+            num_features (int): Gesamteingabe (48 PCA-Komponenten).
+            layers_per_block (int): Anzahl der trainierbaren Schichten nach jedem Daten-Upload.
         """
         super().__init__()
         self.n_qubits = num_qubits
-        self.n_layers = num_layers
-        self.encoding = encoding
-        self.use_scaling = use_scaling
+        self.n_features = num_features
+        # 12 Features pro Block (6x RY, 6x RZ)
+        self.features_per_block = self.n_qubits * 2
+        self.n_blocks = self.n_features // self.features_per_block
 
-        # Device definieren
+        # Device Definition
         dev = qml.device("default.qubit", wires=self.n_qubits)
 
-        # Gewichte-Shape für StronglyEntanglingLayers: (L, Q, 3)
-        weight_shapes = {"weights": (self.n_layers, self.n_qubits, 3)}
+        # Gewichte-Shape: (Blöcke, Schichten, Qubits, 3 Rotationswinkel)
+        weight_shapes = {"weights": (self.n_blocks, layers_per_block, self.n_qubits, 3)}
 
         @qml.qnode(dev, interface="torch", diff_method="backprop")
         def circuit(inputs, weights):
-            # ==========================================
-            # 1. ENCODING LAYER (Daten-Input)
-            # ==========================================
-            if self.encoding == "iqp":
-                # IQP-Style: Superposition -> RZ -> IsingZZ Interaktionen
-                for i in range(self.n_qubits):
-                    qml.Hadamard(wires=i)
+            for i in range(self.n_blocks):
+                # --- ENCODING (Re-Uploading) ---
+                start_idx = i * self.features_per_block
+                block_input = inputs[:, start_idx: start_idx + self.features_per_block]
 
-                # Linearer Teil (Features 0 bis 5)
-                for i in range(self.n_qubits):
-                    qml.RZ(inputs[:, i], wires=i)
+                for q in range(self.n_qubits):
+                    # Nutzt RY und RZ für kompaktes Encoding der 12 Features pro Block
+                    qml.RY(block_input[:, q], wires=q)
+                    qml.RZ(block_input[:, q + self.n_qubits], wires=q)
 
-                # Interaktions-Teil (Features 6 bis 11)
-                for i in range(self.n_qubits):
-                    qml.IsingZZ(inputs[:, i + self.n_qubits], wires=[i, (i + 1) % self.n_qubits])
+                # --- VARIATIONAL LAYER ---
+                qml.StronglyEntanglingLayers(weights[i], wires=range(self.n_qubits))
 
-            else:  # Standard: Dense Angle Encoding
-                # Features 0-5 auf RY, Features 6-11 auf RZ
-                for i in range(self.n_qubits):
-                    qml.RY(inputs[:, i], wires=i)
-                    qml.RZ(inputs[:, i + self.n_qubits], wires=i)
-
-            # ==========================================
-            # 2. VARIATIONAL LAYER (Lernbare Gewichte)
-            # ==========================================
-            qml.StronglyEntanglingLayers(weights, wires=range(self.n_qubits))
-
-            # Messung des ersten Qubits (PauliZ liefert Werte zwischen -1 und 1)
+            # Rückgabe des Erwartungswerts zwischen -1 und 1
             return qml.expval(qml.PauliZ(0))
 
-        # PennyLane QNN Layer
+        # PennyLane QNN Integration
         self.qlayer = qml.qnn.TorchLayer(circuit, weight_shapes)
 
-        # ==========================================
-        # 3. OUTPUT SCALING (Optional)
-        # ==========================================
-        if self.use_scaling:
-            # Initiale Skalierung auf 5.0 hilft dem BCE-Loss, aus dem 0.5-Plateau zu kommen
-            self.scale = nn.Parameter(torch.tensor([5.0]))
-            self.bias = nn.Parameter(torch.tensor([0.0]))
-
-        # Xavier/Glorot Initialisierung der Quanten-Gewichte
+        # Initialisierung der Quanten-Parameter
         with torch.no_grad():
-            for param in self.qlayer.parameters():
-                nn.init.xavier_normal_(param, gain=0.1)
+            nn.init.xavier_normal_(self.qlayer.weights, gain=0.1)
 
     def forward(self, x):
-        """
-        Input x: (Batch_Size, 12)
-        Output:  (Batch_Size, 1) Logits für BCEWithLogitsLoss
-        """
-        # q_out Form: (Batch_Size,)
-        q_out = self.qlayer(x)
+        # Quanten-Output (-1 bis 1)
+        q_out = self.qlayer(x).reshape(-1, 1)
 
-        # Umwandeln in (Batch_Size, 1) für PyTorch Loss-Kompatibilität
-        q_out = q_out.reshape(-1, 1)
-
-        if self.use_scaling:
-            # Transformation: y = w * x + b
-            return q_out * self.scale + self.bias
-
-        return q_out
-
+        # Mapping auf (0 bis 1), um es als Wahrscheinlichkeit zu interpretieren
+        # Das ist "purer" als ein klassisches Scaling, da es nur den Wertebereich verschiebt
+        return (q_out + 1) / 2
