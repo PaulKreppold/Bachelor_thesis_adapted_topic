@@ -8,7 +8,7 @@ RESULTS_DIR = '/Users/paulkreppold/bachelor_thesis/VQC_ablation_study_AmplitudeE
 # Hyperparameter
 SEEDS = [42, 1337, 2024, 7, 101]
 BATCH_SIZE = 32
-NUM_QUBITS = 6
+NUM_QUBITS = 8
 NUM_EPOCHS = 50
 NUM_LAYERS = 4
-LR = 0.001
+LR = 0.01

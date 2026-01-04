@@ -11,9 +11,8 @@ def get_pneumonia_mnist_loaders(batch_size=32, val_split=0.1):
 
 
     transform = transforms.Compose([
-        transforms.Resize((8, 8)),
+        transforms.Resize((16, 16)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[.5], std=[.5]) # Empfohlen für MedMNIST
     ])
 
     # Datensätze laden
