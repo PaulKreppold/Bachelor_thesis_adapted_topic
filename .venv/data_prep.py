@@ -8,10 +8,7 @@ from sklearn.preprocessing import MinMaxScaler
 import numpy as np
 
 
-# ==========================================
-# 2. DATA PREPARATION (inkl. PCA)
-# ==========================================
-def get_pca_data_loaders(batch_size=32, val_split=0.1, n_components=20):
+def get_pca_data_loaders(batch_size=32, val_split=0.1, n_components=12):  # Standard auf 12 gesetzt
     data_flag = 'pneumoniamnist'
     info = INFO[data_flag]
     DataClass = getattr(medmnist, info['python_class'])
@@ -21,22 +18,21 @@ def get_pca_data_loaders(batch_size=32, val_split=0.1, n_components=20):
         transforms.ToTensor(),
     ])
 
-    # Datensätze laden
     full_train_dataset = DataClass(split='train', transform=transform, download=True)
     test_dataset = DataClass(split='test', transform=transform, download=True)
 
-    # Hilfsfunktion zum Extrahieren von flachen Arrays für PCA
     def extract_raw_data(dataset):
         loader = DataLoader(dataset, batch_size=len(dataset))
         images, targets = next(iter(loader))
-        return images.view(len(dataset), -1).numpy(), targets.numpy()
+        # .squeeze() entfernt die überflüssige Dimension bei den Labels (N, 1) -> (N,)
+        return images.view(len(dataset), -1).numpy(), targets.numpy().squeeze()
 
-    # Rohdaten extrahieren
     x_train_raw, y_train_raw = extract_raw_data(full_train_dataset)
     x_test_raw, y_test_raw = extract_raw_data(test_dataset)
 
-    # PCA Fitting (nur auf Training!)
+    # PCA & Scaling
     pca = PCA(n_components=n_components)
+    # 0 bis pi ist ideal für RY/RZ-Encoding, um den Hilbert-Raum gut zu nutzen
     scaler = MinMaxScaler(feature_range=(0, np.pi))
 
     x_train_pca = pca.fit_transform(x_train_raw)
@@ -45,10 +41,12 @@ def get_pca_data_loaders(batch_size=32, val_split=0.1, n_components=20):
     x_test_pca = pca.transform(x_test_raw)
     x_test_scaled = scaler.transform(x_test_pca)
 
-    # Zurück in PyTorch Tensoren wandeln
+    # Tensoren erstellen (Labels als LongTensor für Klassifikation)
     train_tensor = torch.utils.data.TensorDataset(
         torch.FloatTensor(x_train_scaled), torch.LongTensor(y_train_raw)
     )
+
+    # Test Loader direkt hier erstellen
     test_loader = DataLoader(
         torch.utils.data.TensorDataset(torch.FloatTensor(x_test_scaled), torch.LongTensor(y_test_raw)),
         batch_size=batch_size, shuffle=False

@@ -1,17 +1,23 @@
 import torch
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-RESULTS_DIR = '/Users/paulkreppold/bachelor_thesis/VQC_PCA_DenseEncoding_Pneumonia'
-SEEDS = [42, 1337, 2024]#, 7, 101]
-BATCH_SIZE = 32
-NUM_QUBITS = 6
-NUM_FEATURES = NUM_QUBITS * 2 # 10 Qubits * 2 (RY & RZ)
-NUM_EPOCHS = 100
-NUM_LAYERS = 2
-LR = 0.01
+RESULTS_DIR = '/Users/paulkreppold/bachelor_thesis/VQC_PCA_Dense_AngleEncoding_second_test'
 
-# Definition der Grid-Profile: (Name, Qubits, Layers)
-GRID_PROFILES = [
-    {"name": "Q6_L2", "qubits": 6, "layers": 2}
+# Statistik & Training
+SEEDS = [42, 1337, 2024]
+BATCH_SIZE = 32
+NUM_EPOCHS = 100
+LR = 0.001
+
+# Quanten-Architektur
+NUM_QUBITS = 6
+NUM_FEATURES = NUM_QUBITS * 2
+NUM_LAYERS = 6
+
+# Experiment-Konfigurationen (Die 2x2 Matrix)
+EXPERIMENT_CONFIGS = [
+    {"encoding": "angle", "use_scaling": False},
+    {"encoding": "angle", "use_scaling": True},
+    {"encoding": "iqp",   "use_scaling": False},
+    {"encoding": "iqp",   "use_scaling": True},
 ]
-ABLATION_ENCODINGS = ["RY_RZ", "RX_RY", "RX_RZ"]

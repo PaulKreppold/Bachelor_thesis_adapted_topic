@@ -78,6 +78,7 @@ def evaluate_model(model, data_loader, criterion, device):
 
     with torch.no_grad():
         for inputs, targets in data_loader:
+            # Für BCE: Labels zu Float und (N, 1)
             targets_bce = targets.to(device).float().view(-1, 1)
             inputs = inputs.to(device)
 
@@ -85,12 +86,15 @@ def evaluate_model(model, data_loader, criterion, device):
             loss = criterion(outputs, targets_bce)
             running_loss += loss.item() * inputs.size(0)
 
+            # Schwellenwert 0 für Logits
             preds = (outputs > 0).float()
+
             correct += (preds == targets_bce).sum().item()
             total += targets_bce.size(0)
 
-            all_preds.extend(preds.cpu().numpy())
-            all_targets.extend(targets.cpu().numpy())
+            # In flache Listen umwandeln für Confusion Matrix
+            all_preds.extend(preds.cpu().numpy().flatten())
+            all_targets.extend(targets.numpy().flatten())  # targets sind hier noch auf CPU/Long
 
     cm = confusion_matrix(all_targets, all_preds, labels=[0, 1])
     return running_loss / total, correct / total, cm

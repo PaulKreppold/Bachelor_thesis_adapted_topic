@@ -1,77 +1,93 @@
-import numpy as np
 import torch
 import torch.nn as nn
 import pennylane as qml
-import config
 
 
 class QuantumModel(nn.Module):
-    def __init__(
-            self,
-            num_qubits=config.NUM_QUBITS,
-            num_layers=config.NUM_LAYERS,
-            init_mode="identity",
-            encoding_mode="RY_RZ"
-    ):
+    def __init__(self, num_qubits=6, num_layers=6, encoding="angle", use_scaling=True):
+        """
+        Variational Quantum Classifier (VQC)
+
+        Args:
+            num_qubits (int): Anzahl der Qubits (standardmäßig 6).
+            num_layers (int): Tiefe des Variational Circuits.
+            encoding (str): "angle" für Dense Angle Encoding oder "iqp" für IQP-style Mapping.
+            use_scaling (bool): Wenn True, werden lernbare Scale- und Bias-Parameter hinzugefügt.
+        """
         super().__init__()
-        self.num_qubits = num_qubits
-        self.num_layers = num_layers
-        self.encoding_mode = encoding_mode
-        self.init_mode = init_mode
+        self.n_qubits = num_qubits
+        self.n_layers = num_layers
+        self.encoding = encoding
+        self.use_scaling = use_scaling
 
-        num_feat = self.num_qubits * 2
-        dev = qml.device("default.qubit", wires=self.num_qubits)
+        # Device definieren
+        dev = qml.device("default.qubit", wires=self.n_qubits)
 
-        # Shapes für TorchLayer
-        self.weight_shapes = {
-            "weights": (self.num_layers, self.num_qubits),
-            "s_alpha": (num_feat,),
-            "s_beta": (num_feat,)
-        }
+        # Gewichte-Shape für StronglyEntanglingLayers: (L, Q, 3)
+        weight_shapes = {"weights": (self.n_layers, self.n_qubits, 3)}
 
-        @qml.qnode(dev, interface="torch")
-        def circuit(inputs, weights, s_alpha, s_beta):
-            # Transformation: x' = alpha * x + beta
-            # WICHTIG: Wir nutzen torch.clamp oder halten die Werte klein,
-            # um die Periodizität zu kontrollieren.
-            transformed_inputs = s_alpha * inputs + s_beta
+        @qml.qnode(dev, interface="torch", diff_method="backprop")
+        def circuit(inputs, weights):
+            # ==========================================
+            # 1. ENCODING LAYER (Daten-Input)
+            # ==========================================
+            if self.encoding == "iqp":
+                # IQP-Style: Superposition -> RZ -> IsingZZ Interaktionen
+                for i in range(self.n_qubits):
+                    qml.Hadamard(wires=i)
 
-            for l in range(self.num_layers):
-                # 1. Data Re-Uploading
-                for i in range(self.num_qubits):
-                    f1 = transformed_inputs[:, i]
-                    f2 = transformed_inputs[:, i + self.num_qubits]
+                # Linearer Teil (Features 0 bis 5)
+                for i in range(self.n_qubits):
+                    qml.RZ(inputs[:, i], wires=i)
 
-                    if self.encoding_mode == "RY_RZ":
-                        qml.RY(f1, wires=i)
-                        qml.RZ(f2, wires=i)
-                    elif self.encoding_mode == "RX_RY":
-                        qml.RX(f1, wires=i)
-                        qml.RY(f2, wires=i)
+                # Interaktions-Teil (Features 6 bis 11)
+                for i in range(self.n_qubits):
+                    qml.IsingZZ(inputs[:, i + self.n_qubits], wires=[i, (i + 1) % self.n_qubits])
 
-                # 2. Variational Layer (HEA)
-                for i in range(self.num_qubits):
-                    qml.RY(weights[l, i], wires=i)
+            else:  # Standard: Dense Angle Encoding
+                # Features 0-5 auf RY, Features 6-11 auf RZ
+                for i in range(self.n_qubits):
+                    qml.RY(inputs[:, i], wires=i)
+                    qml.RZ(inputs[:, i + self.n_qubits], wires=i)
 
-                # 3. Entanglement
-                for i in range(self.num_qubits):
-                    qml.CNOT(wires=[i, (i + 1) % self.num_qubits])
+            # ==========================================
+            # 2. VARIATIONAL LAYER (Lernbare Gewichte)
+            # ==========================================
+            qml.StronglyEntanglingLayers(weights, wires=range(self.n_qubits))
 
+            # Messung des ersten Qubits (PauliZ liefert Werte zwischen -1 und 1)
             return qml.expval(qml.PauliZ(0))
 
-        self.qlayer = qml.qnn.TorchLayer(circuit, self.weight_shapes)
+        # PennyLane QNN Layer
+        self.qlayer = qml.qnn.TorchLayer(circuit, weight_shapes)
 
-        # --- STABILE INITIALISIERUNG (Entscheidend!) ---
+        # ==========================================
+        # 3. OUTPUT SCALING (Optional)
+        # ==========================================
+        if self.use_scaling:
+            # Initiale Skalierung auf 5.0 hilft dem BCE-Loss, aus dem 0.5-Plateau zu kommen
+            self.scale = nn.Parameter(torch.tensor([5.0]))
+            self.bias = nn.Parameter(torch.tensor([0.0]))
+
+        # Xavier/Glorot Initialisierung der Quanten-Gewichte
         with torch.no_grad():
-            # Alpha muss bei 1.0 starten (Identität)
-            self.qlayer.s_alpha.fill_(1.0)
-            # Beta muss bei 0.0 starten
-            self.qlayer.s_beta.fill_(0.0)
-
-            if self.init_mode == "identity":
-                # Gewichte nahe 0, damit der Layer anfangs "durchsichtig" ist
-                nn.init.normal_(self.qlayer.weights, mean=0.0, std=0.01)
+            for param in self.qlayer.parameters():
+                nn.init.xavier_normal_(param, gain=0.1)
 
     def forward(self, x):
+        """
+        Input x: (Batch_Size, 12)
+        Output:  (Batch_Size, 1) Logits für BCEWithLogitsLoss
+        """
+        # q_out Form: (Batch_Size,)
         q_out = self.qlayer(x)
-        return q_out.unsqueeze(1)
+
+        # Umwandeln in (Batch_Size, 1) für PyTorch Loss-Kompatibilität
+        q_out = q_out.reshape(-1, 1)
+
+        if self.use_scaling:
+            # Transformation: y = w * x + b
+            return q_out * self.scale + self.bias
+
+        return q_out
+
