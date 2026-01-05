@@ -4,7 +4,6 @@ import numpy as np
 import pandas as pd
 import os
 import torch
-import torch.nn as nn
 
 
 def plot_averaged_results(all_histories, save_dir):
@@ -80,50 +79,6 @@ def plot_average_confusion_matrix(scenario_metrics, scenario_name, save_dir):
     print(f"Average Confusion Matrix für {scenario_name} gespeichert.")
 
 
-def plot_master_comparison(all_results, save_dir):
-    """
-    Erstellt einen Balkendiagramm-Vergleich aller Ablation-Szenarien.
-    all_results: Liste von Dicts mit 'scenario', 'mean_acc', 'std_acc'
-    """
-    # Daten in DataFrame umwandeln
-    df = pd.DataFrame(all_results)
-
-    # Sortieren für bessere Optik (optional)
-    df = df.sort_values(by='mean_acc', ascending=False)
-
-    plt.figure(figsize=(12, 7))
-    sns.set_style("whitegrid")
-
-    # Balkendiagramm mit Fehlerbalken
-    bars = plt.bar(df['scenario'], df['mean_acc'] * 100,
-                   yerr=df['std_acc'] * 100,
-                   capsize=10, color='skyblue', edgecolor='navy', alpha=0.8)
-
-    # Werte über die Balken schreiben
-    for bar in bars:
-        yval = bar.get_height()
-        plt.text(bar.get_x() + bar.get_width() / 2, yval + 1,
-                 f'{yval:.1f}%', ha='center', va='bottom', fontweight='bold')
-
-    plt.xticks(rotation=45, ha='right')
-    plt.ylabel('Test Accuracy (%)')
-    plt.xlabel('Experimentelles Szenario')
-    plt.title('Ablationsstudie: Vergleich der VQC-Architekturen (PneumoniaMNIST)')
-
-    # 74% Referenzlinie (Majority Class Bias)
-    plt.axhline(y=74.0, color='red', linestyle='--', label='Majority Class Baseline (74%)')
-
-    plt.legend()
-    plt.tight_layout()
-
-    plt.savefig(os.path.join(save_dir, "master_ablation_comparison.png"))
-    plt.close()
-
-    # Tabelle als CSV speichern für die Thesis-Anhänge
-    df[['scenario', 'mean_acc', 'std_acc']].to_csv(
-        os.path.join(save_dir, "ablation_results_table.csv"), index=False
-    )
-    print(f"Master-Vergleich gespeichert in {save_dir}")
 
 
 def plot_test_accuracy_distribution(test_accs, results_dir):
@@ -160,87 +115,74 @@ def plot_prediction_histogram(model, data_loader, save_path, device):
     plt.close()
 
 
-def log_sample_predictions(model, data_loader, save_path, device, num_batches=5):
-    """Speichert Samples für die Error-Visualisierung."""
-    model.eval()
-    criterion = nn.BCELoss(reduction='none')
-    with open(save_path, "w") as f:
-        f.write("Sample\tPrediction\tGroundTruth\tIndiv_Loss\n")
-        with torch.no_grad():
-            for b_idx, (x, y) in enumerate(data_loader):
-                if b_idx >= num_batches: break
-                y_float = y.to(device).float().view(-1, 1)
-                out = model(x.to(device))
-                losses = criterion(out, y_float)
-                for i in range(x.shape[0]):
-                    f.write(f"{b_idx * len(x) + i}\t{out[i].item():.4f}\t{y[i].item():.0f}\t{losses[i].item():.4f}\n")
-
-
-def visualize_top_errors(log_file_path, raw_dataset, num_samples=3, save_path=None):
-    """Zeigt Bilder mit höchstem Loss."""
-    if not os.path.exists(log_file_path): return
-    df = pd.read_csv(log_file_path, sep='\t')
-    top_errors = df.sort_values(by='Indiv_Loss', ascending=False).head(num_samples)
-    plt.figure(figsize=(15, 6))
-    for i, (idx, row) in enumerate(top_errors.iterrows()):
-        img, _ = raw_dataset[int(row['Sample'])]
-        plt.subplot(1, num_samples, i + 1)
-        plt.imshow(np.array(img), cmap='gray')
-        pred, gt = row['Prediction'], row['GroundTruth']
-        color = 'green' if (pred >= 0.5 and gt == 1) or (pred < 0.5 and gt == 0) else 'red'
-        plt.title(f"Pred: {pred:.2f} | GT: {int(gt)}\nLoss: {row['Indiv_Loss']:.3f}", color=color)
-        plt.axis('off')
-    if save_path: plt.savefig(save_path, dpi=300)
-    plt.close()
-
-
-def analyze_batch_uncertainty(model, loader, device, save_dir, stage="initial", seed=None):
+def plot_ablation_training_comparison(all_scenarios_data, save_dir):
     """
-    Analysiert den ersten Batch auf Unsicherheit und speichert Tabelle + Plot inkl. Seed-Info.
+    Vergleicht alle Ablation-Szenarien in zwei Plots (Train-Loss und Train-Acc).
+    Jede Linie ist der Durchschnitt über die Seeds des jeweiligen Szenarios.
     """
-    model.eval()
-    inputs, targets = next(iter(loader))
-    inputs = inputs.to(device)
-    targets_float = targets.view(-1, 1).float().to(device)
+    plt.figure(figsize=(16, 6))
 
-    with torch.no_grad():
-        outputs = model(inputs)
-        loss_fn = nn.BCELoss(reduction='none')
-        individual_losses = loss_fn(outputs, targets_float)
+    # 1. Plot für Train Loss
+    plt.subplot(1, 2, 1)
+    for data in all_scenarios_data:
+        # data['history'] ist eine Liste von Dicts (eines pro Seed)
+        all_losses = [h['loss'] for h in data['history']]
+        # Mittelwert über Seeds berechnen
+        mean_loss = np.mean(all_losses, axis=0)
+        plt.plot(range(1, len(mean_loss) + 1), mean_loss, label=data['scenario'])
 
-    outputs_np = outputs.cpu().numpy().flatten()
-    targets_np = targets.cpu().numpy().flatten()
-    losses_np = individual_losses.cpu().numpy().flatten()
+    plt.title('Train Loss Vergleich (Mittelwert über Seeds)')
+    plt.xlabel('Epochen')
+    plt.ylabel('BCE Loss')
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize='small')
+    plt.grid(True, alpha=0.3)
 
-    # DataFrame erstellen und SEED hinzufügen
-    df = pd.DataFrame({
-        'Seed': [seed] * len(inputs),  # Neue Spalte für den Seed
-        'ID': range(len(inputs)),
-        'Pred': outputs_np,
-        'GT': targets_np,
-        'Loss': losses_np,
-        'Dist_0.5': np.abs(outputs_np - 0.5)
-    }).sort_values(by='Dist_0.5')
+    # 2. Plot für Train Accuracy
+    plt.subplot(1, 2, 2)
+    for data in all_scenarios_data:
+        all_accs = [h['acc'] for h in data['history']]
+        mean_acc = np.mean(all_accs, axis=0)
+        plt.plot(range(1, len(mean_acc) + 1), mean_acc, label=data['scenario'])
 
-    # Dateiname enthält nun auch den Seed zur eindeutigen Identifizierung
-    csv_filename = f"uncertainty_{stage}_seed_{seed}.csv"
-    df.to_csv(os.path.join(save_dir, csv_filename), index=False)
+    plt.title('Train Accuracy Vergleich (Mittelwert über Seeds)')
+    plt.xlabel('Epochen')
+    plt.ylabel('Accuracy')
+    plt.grid(True, alpha=0.3)
 
-    # Plotting mit Seed im Titel
-    plt.figure(figsize=(10, 5))
-    sns.stripplot(x=outputs_np, y=targets_np.astype(str), hue=targets_np,
-                  palette={0: 'blue', 1: 'red'}, jitter=0.1, alpha=0.7, orient='h', order=['0', '1'])
-
-    plt.axvline(x=0.5, color='black', linestyle='--')
-    plt.axvspan(0.4, 0.6, color='yellow', alpha=0.1)
-
-    plt.title(f"Unsicherheits-Analyse ({stage.upper()}) | Seed: {seed}")
-    plt.xlabel("Vorhersage Wahrscheinlichkeit (Pneumonie)")
-    plt.ylabel("Ground Truth Label")
-    plt.xlim(-0.05, 1.05)
-    plt.grid(True, alpha=0.2)
     plt.tight_layout()
-
-    plot_filename = f"uncertainty_plot_{stage}_seed_{seed}.png"
-    plt.savefig(os.path.join(save_dir, plot_filename))
+    plt.savefig(os.path.join(save_dir, "ablation_training_comparison.png"), dpi=300)
     plt.close()
+
+
+def plot_master_comparison(all_results, save_dir):
+    """Balkendiagramm der Test-Accuracy mit korrigierter 62.5% Baseline."""
+    df = pd.DataFrame(all_results)
+    df['mean_acc_pct'] = df['mean_acc'] * 100
+    df['std_acc_pct'] = df['std_acc'] * 100
+    df = df.sort_values(by='mean_acc_pct', ascending=True)
+
+    plt.figure(figsize=(12, 8))
+    sns.set_style("whitegrid")
+
+    bars = plt.barh(df['scenario'], df['mean_acc_pct'],
+                    xerr=df['std_acc_pct'],
+                    color='skyblue', edgecolor='navy', alpha=0.8, capsize=5)
+
+    # KORREKTUR: Test-Set Baseline
+    plt.axvline(x=62.5, color='red', linestyle='--', linewidth=2,
+                label='Majority Class Test Baseline (62.5%)')
+
+    plt.title('VQC Ablationsstudie: Vergleich der Test-Accuracy', fontsize=16, pad=20)
+    plt.xlabel('Test Accuracy (%)', fontsize=12)
+    plt.xlim(0, 100)
+
+    for bar in bars:
+        width = bar.get_width()
+        plt.text(width + 1, bar.get_y() + bar.get_height() / 2,
+                 f'{width:.2f}%', va='center', fontsize=10, fontweight='bold')
+
+    plt.legend(loc='lower right')
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "master_ablation_comparison.png"), dpi=300)
+    plt.close()
+

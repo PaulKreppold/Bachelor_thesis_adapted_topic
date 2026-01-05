@@ -1,54 +1,31 @@
 import torch
 import os
 
-# --- System & Pfade ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-RESULTS_DIR = '/Users/paulkreppold/bachelor_thesis/new_ablation_study_for_PCA_&_AngleEncoding'
+RESULTS_DIR = '/Users/paulkreppold/bachelor_thesis/Umfangreiche_Ablation_AngleEncoding'
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
-# --- Statistik & Training ---
 SEEDS = [42, 1337, 2024]
 BATCH_SIZE = 32
-NUM_EPOCHS = 50
-LR = 0.001
+NUM_EPOCHS = 40
 
-# --- ABLATION SCENARIOS ---
-# Erläuterung der Parameter:
-# 'weighted': Bestraft Fehler bei Klasse 0 (Gesund) stärker (hilft gegen 0.4-Loss-Plateau).
-# 'trainable_enc': Modell lernt Feature-Importance (w*x + b).
-# 'measurement': 'mean' (lokale Observablen) vs 'first' (globale Observable).
+# --- UMFANGREICHE ABLATION SCENARIOS ---
 ABLATION_SCENARIOS = [
-    # 1. Baseline & Qubit-Variation
-    {"name": "Q4_Base", "qubits": 4, "features": 48, "layers": 1, "encoding": "dense", "type": "strongly_entangling",
-     "reuploading": True, "weighted": False, "trainable_enc": False, "measurement": "mean"},
-    {"name": "Q6_Base", "qubits": 6, "features": 48, "layers": 1, "encoding": "dense", "type": "strongly_entangling",
-     "reuploading": True, "weighted": False, "trainable_enc": False, "measurement": "mean"},
-    {"name": "Q8_Base", "qubits": 8, "features": 48, "layers": 1, "encoding": "dense", "type": "strongly_entangling",
-     "reuploading": True, "weighted": False, "trainable_enc": False, "measurement": "mean"},
+    # PHASE 1: Architektur-Isolation (Basis: Q6, L2, Dense, HE, Ring, First, LR 0.001)
+    {"name": "P1_Baseline_HE_Ring_First", "qubits": 6, "layers": 2, "encoding": "dense", "ansatz": "hardware_efficient", "entanglement": "ring", "measurement": "first", "lr": 0.001},
+    {"name": "P1_Var_Encoding_Standard", "qubits": 6, "layers": 2, "encoding": "standard", "ansatz": "hardware_efficient", "entanglement": "ring", "measurement": "first", "lr": 0.001},
+    {"name": "P1_Var_Ansatz_Strongly", "qubits": 6, "layers": 2, "encoding": "dense", "ansatz": "strongly", "entanglement": "ring", "measurement": "first", "lr": 0.001},
+    {"name": "P1_Var_Entanglement_AllToAll", "qubits": 6, "layers": 2, "encoding": "dense", "ansatz": "hardware_efficient", "entanglement": "all_to_all", "measurement": "first", "lr": 0.001},
+    {"name": "P1_Var_Measure_Mean", "qubits": 6, "layers": 2, "encoding": "dense", "ansatz": "hardware_efficient", "entanglement": "ring", "measurement": "mean", "lr": 0.001},
+    {"name": "P1_Var_Measure_Softmax", "qubits": 6, "layers": 2, "encoding": "dense", "ansatz": "hardware_efficient", "entanglement": "ring", "measurement": "softmax", "lr": 0.001},
 
-    # 2. Re-Uploading Check (Fair Comparison)
-    {"name": "Q6_NoReupload_12f", "qubits": 6, "features": 12, "layers": 1, "encoding": "dense",
-     "type": "strongly_entangling", "reuploading": False, "weighted": False, "trainable_enc": False,
-     "measurement": "mean"},
-    {"name": "Q6_StandardEnc_48f", "qubits": 6, "features": 48, "layers": 1, "encoding": "standard",
-     "type": "strongly_entangling", "reuploading": True, "weighted": False, "trainable_enc": False,
-     "measurement": "mean"},
+    # PHASE 2: Skalierungs-Matrix (Beispiel-Auswahl aus 4x4 Qubit/Layer Matrix)
+    {"name": "P2_Q4_L2", "qubits": 4, "layers": 2, "encoding": "dense", "ansatz": "hardware_efficient", "entanglement": "ring", "measurement": "first", "lr": 0.001},
+    {"name": "P2_Q4_L8", "qubits": 4, "layers": 8, "encoding": "dense", "ansatz": "hardware_efficient", "entanglement": "ring", "measurement": "first", "lr": 0.001},
+    {"name": "P2_Q8_L4", "qubits": 8, "layers": 4, "encoding": "dense", "ansatz": "hardware_efficient", "entanglement": "ring", "measurement": "first", "lr": 0.001},
+    {"name": "P2_Q10_L8", "qubits": 10, "layers": 8, "encoding": "dense", "ansatz": "hardware_efficient", "entanglement": "ring", "measurement": "first", "lr": 0.001},
 
-    # 3. Mess-Strategie (Global vs. Lokal)
-    {"name": "Q6_Measure_FirstOnly", "qubits": 6, "features": 48, "layers": 1, "encoding": "dense",
-     "type": "strongly_entangling", "reuploading": True, "weighted": False, "trainable_enc": False,
-     "measurement": "first"},
-
-    # 4. Die "Loss-Knacker" (Ziel: < 0.4 Loss)
-    {"name": "Q6_WeightedLoss", "qubits": 6, "features": 48, "layers": 1, "encoding": "dense",
-     "type": "strongly_entangling", "reuploading": True, "weighted": True, "trainable_enc": False,
-     "measurement": "mean"},
-    {"name": "Q6_TrainableEncoding", "qubits": 6, "features": 48, "layers": 1, "encoding": "dense",
-     "type": "strongly_entangling", "reuploading": True, "weighted": False, "trainable_enc": True,
-     "measurement": "mean"},
-
-    # 5. Maximal-Modell
-    {"name": "Q6_L2_Weighted_Trainable", "qubits": 6, "features": 48, "layers": 2, "encoding": "dense",
-     "type": "strongly_entangling", "reuploading": True, "weighted": True, "trainable_enc": True,
-     "measurement": "mean"},
+    # PHASE 3: Hyperparameter
+    {"name": "P3_LR_0.01", "qubits": 6, "layers": 2, "encoding": "dense", "ansatz": "hardware_efficient", "entanglement": "ring", "measurement": "first", "lr": 0.01},
+    {"name": "P3_LR_0.005", "qubits": 6, "layers": 2, "encoding": "dense", "ansatz": "hardware_efficient", "entanglement": "ring", "measurement": "first", "lr": 0.005},
 ]
