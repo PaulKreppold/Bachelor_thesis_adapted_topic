@@ -11,108 +11,110 @@ from Base_Line import QuantumModelDRU
 
 from plots import (
     plot_averaged_results,
+    plot_average_confusion_matrix,
     plot_test_accuracy_distribution,
     plot_prediction_histogram,
     log_sample_predictions,
     visualize_top_errors,
-    analyze_batch_uncertainty  # <--- Neu importiert
+    analyze_batch_uncertainty,
+    plot_master_comparison
 )
 
 
 def main():
-    os.makedirs(config.RESULTS_DIR, exist_ok=True)
+    base_dir = config.RESULTS_DIR
+    os.makedirs(base_dir, exist_ok=True)
 
-    # 1. Roh-Daten laden
     data_flag = 'pneumoniamnist'
     info = INFO[data_flag]
     DataClass = getattr(medmnist, info['python_class'])
     raw_test_dataset = DataClass(split='test', download=True)
 
-    # 2. Daten laden (48 PCA-Komponenten laut config)
-    print(f"\n[1/3] Lade Daten mit PCA: {config.NUM_FEATURES} Komponenten...")
-    train_loader, val_loader, test_loader = get_pca_data_loaders(
-        batch_size=config.BATCH_SIZE,
-        n_components=config.NUM_FEATURES
-    )
+    all_ablation_results = []
 
-    all_histories = []
-    test_results = []
+    for scenario in config.ABLATION_SCENARIOS:
+        print(f"\n{'#' * 80}\nSZENARIO: {scenario['name']}\n{'#' * 80}")
+        scenario_dir = os.path.join(base_dir, scenario['name'])
+        os.makedirs(scenario_dir, exist_ok=True)
 
-    for i, seed in enumerate(config.SEEDS):
-        print(f"\n--- [Lauf {i + 1}/{len(config.SEEDS)} | Seed: {seed}] ---")
-
-        # Seed-Ordner sofort erstellen
-        seed_dir = os.path.join(config.RESULTS_DIR, f"seed_{seed}")
-        os.makedirs(seed_dir, exist_ok=True)
-
-        # Reproduzierbarkeit
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-
-        # 3. Modell initialisieren
-        model = QuantumModelDRU(
-            num_qubits=config.NUM_QUBITS,
-            num_features=config.NUM_FEATURES,
-            layers_per_block=config.LAYERS_PER_BLOCK
-        ).to(config.DEVICE)
-
-        # === A. INITIALE ANALYSE (Untrainierter Zustand) ===
-        print("Erstelle initiale Unsicherheits-Analyse...")
-        analyze_batch_uncertainty(model, train_loader, config.DEVICE, seed_dir, stage="initial", seed=seed)
-
-        optimizer = torch.optim.Adam(model.parameters(), lr=config.LR)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=8, min_lr=1e-7
+        # Daten laden (Features variieren je nach Szenario)
+        train_loader, val_loader, test_loader = get_pca_data_loaders(
+            batch_size=config.BATCH_SIZE, n_components=scenario['features']
         )
-        criterion = torch.nn.BCELoss()
 
-        # --- 4. TRAINING ---
-        history = train_model(
-            model=model,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            optimizer=optimizer,
-            criterion=criterion,
-            scheduler=scheduler,
-            epochs=config.NUM_EPOCHS,
-            seed=seed,
-            device=config.DEVICE
-        )
-        all_histories.append(history)
+        scenario_histories, scenario_metrics = [], []
 
-        # === B. FINALE ANALYSE (Nach Training) ===
-        print("Erstelle finale Unsicherheits-Analyse...")
-        analyze_batch_uncertainty(model, train_loader, config.DEVICE, seed_dir, stage="final", seed=seed)
+        for seed in config.SEEDS:
+            print(f"\n--- [Seed: {seed}] ---")
+            seed_dir = os.path.join(scenario_dir, f"seed_{seed}")
+            os.makedirs(seed_dir, exist_ok=True)
 
-        # --- 5. EVALUATION ---
-        test_loss, test_acc, test_cm = evaluate_model(model, test_loader, criterion, config.DEVICE)
-        test_results.append({'loss': test_loss, 'acc': test_acc, 'cm': test_cm})
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+            if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
 
-        # --- 6. WEITERE PLOTS ---
-        plot_prediction_histogram(model, test_loader, os.path.join(seed_dir, "pred_hist.png"), device=config.DEVICE)
-        sample_log_path = os.path.join(seed_dir, "samples.txt")
-        log_sample_predictions(model, test_loader, sample_log_path, device=config.DEVICE)
-        visualize_top_errors(sample_log_path, raw_test_dataset, num_samples=3,
-                             save_path=os.path.join(seed_dir, "top_errors.png"))
+            model = QuantumModelDRU(
+                num_qubits=scenario['qubits'],
+                num_features=scenario['features'],
+                layers_per_block=scenario['layers'],
+                encoding_type=scenario['encoding'],
+                circuit_type=scenario['type'],
+                use_reuploading=scenario['reuploading'],
+                trainable_enc=scenario['trainable_enc'],
+                measurement=scenario['measurement']
+            ).to(config.DEVICE)
 
-        print(f"Seed {seed} abgeschlossen. Acc: {test_acc * 100:.2f}%")
+            analyze_batch_uncertainty(model, train_loader, config.DEVICE, seed_dir, stage="initial", seed=seed)
 
-    # --- 7. GESAMT-AUSWERTUNG ---
-    avg_acc = np.mean([r['acc'] for r in test_results])
-    std_acc = np.std([r['acc'] for r in test_results])
+            optimizer = torch.optim.Adam(model.parameters(), lr=config.LR)
 
-    plot_averaged_results(all_histories, config.RESULTS_DIR)
-    plot_test_accuracy_distribution([r['acc'] for r in test_results], config.RESULTS_DIR)
+            # --- Dynamischer Loss ---
+            if scenario['weighted']:
+                # Wir geben der Klasse 0 (Gesund) mehr Gewicht, da sie seltener ist (1:2.8 Ratio)
+                # BCELoss kann Gewichte pro Sample verarbeiten
+                criterion = torch.nn.BCELoss(reduction='none')
+            else:
+                criterion = torch.nn.BCELoss()
 
-    # Bericht schreiben
-    summary_path = os.path.join(config.RESULTS_DIR, "FINAL_SUMMARY.txt")
-    with open(summary_path, "w") as f:
-        f.write(f"ERGEBNISSE VQC DRU\nL_per_Block: {config.LAYERS_PER_BLOCK}\n")
-        f.write(f"Mean Acc: {avg_acc * 100:.2f}% +- {std_acc * 100:.2f}%\n")
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=8)
 
-    print(f"\nTraining beendet. Ergebnisse in {config.RESULTS_DIR}")
+            # Training (Stelle sicher, dass train_model die 'reduction=none' Logik beherrscht)
+            history = train_model(
+                model=model, train_loader=train_loader, val_loader=val_loader,
+                optimizer=optimizer, criterion=criterion, scheduler=scheduler,
+                epochs=config.NUM_EPOCHS, seed=seed, device=config.DEVICE,
+                is_weighted=scenario['weighted']  # Flag an train_model übergeben
+            )
+            scenario_histories.append(history)
+
+            analyze_batch_uncertainty(model, train_loader, config.DEVICE, seed_dir, stage="final", seed=seed)
+
+            # Eval (Standard BCELoss für Metriken)
+            t_loss, t_acc, t_cm = evaluate_model(model, test_loader, torch.nn.BCELoss(), config.DEVICE)
+            scenario_metrics.append({'loss': t_loss, 'acc': t_acc, 'cm': t_cm})
+
+            plot_prediction_histogram(model, test_loader, os.path.join(seed_dir, "hist.png"), device=config.DEVICE)
+
+        plot_averaged_results(scenario_histories, scenario_dir)
+        plot_test_accuracy_distribution([m['acc'] for m in scenario_metrics], scenario_dir)
+
+        plot_average_confusion_matrix(scenario_metrics, scenario['name'], scenario_dir)
+
+        print(f"\nSzenario {scenario['name']} beendet.")
+
+        all_ablation_results.append({
+            'scenario': scenario['name'],
+            'mean_acc': np.mean([m['acc'] for m in scenario_metrics]),
+            'std_acc': np.std([m['acc'] for m in scenario_metrics]),
+            'history': scenario_histories,
+            'metrics': scenario_metrics
+        })
+
+        plot_averaged_results(scenario_histories, scenario_dir)
+        plot_test_accuracy_distribution([m['acc'] for m in scenario_metrics], scenario_dir)
+
+    print(f"\nERSTELLE MASTER COMPARISON...")
+    plot_master_comparison(all_ablation_results, base_dir)
 
 
 if __name__ == "__main__":

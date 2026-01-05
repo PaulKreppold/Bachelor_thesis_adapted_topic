@@ -43,50 +43,87 @@ def plot_averaged_results(all_histories, save_dir):
     plt.close()
 
 
-def plot_master_comparison(all_exp_data, save_dir):
+def plot_average_confusion_matrix(scenario_metrics, scenario_name, save_dir):
     """
-    Erstellt den 'Master-Plot': Vergleicht alle 4 Experimente in einer Grafik.
-    all_exp_data: Liste von Dicts [{'name': str, 'histories': list}, ...]
+    Berechnet die durchschnittliche Confusion Matrix über alle Seeds eines Szenarios
+    und plottet diese als Heatmap.
     """
-    plt.figure(figsize=(14, 6))
-    sns.set_theme(style="whitegrid")
+    # 1. Alle CMs extrahieren und summieren
+    all_cms = [m['cm'] for m in scenario_metrics]
+    avg_cm = np.mean(all_cms, axis=0)
 
-    # Farben und Styles für die 4 Varianten
-    styles = {
-        "Enc-angle_Scale-False": ("blue", "--"),
-        "Enc-angle_Scale-True": ("blue", "-"),
-        "Enc-iqp_Scale-False": ("red", "--"),
-        "Enc-iqp_Scale-True": ("red", "-")
-    }
+    # 2. Normalisierung (Prozentual pro Ground Truth Zeile)
+    # Zeigt: Wie viel Prozent der Gesunden wurden als Gesund erkannt?
+    cm_perc = avg_cm.astype('float') / avg_cm.sum(axis=1)[:, np.newaxis]
 
-    metrics = [('val_loss', 'Validation Loss', 1), ('val_acc', 'Validation Accuracy', 2)]
+    plt.figure(figsize=(8, 6))
 
-    for key, label, idx in metrics:
-        plt.subplot(1, 2, idx)
-        for exp in all_exp_data:
-            name = exp['name']
-            histories = exp['histories']
-            color, ls = styles.get(name, ("black", "-"))
+    # Labels für die Matrix
+    labels = ['Gesund (0)', 'Pneumonie (1)']
 
-            # Mittelwert über Seeds berechnen (mit Padding)
-            max_len = max(len(h[key]) for h in histories)
-            padded = []
-            for h in histories:
-                series = list(h[key])
-                series += [series[-1]] * (max_len - len(series))
-                padded.append(series)
+    # Annotations erstellen (Kombination aus Absolutwert und Prozent)
+    annot = [
+        [f"{avg_cm[0, 0]:.1f}\n({cm_perc[0, 0]:.1%})", f"{avg_cm[0, 1]:.1f}\n({cm_perc[0, 1]:.1%})"],
+        [f"{avg_cm[1, 0]:.1f}\n({cm_perc[1, 0]:.1%})", f"{avg_cm[1, 1]:.1f}\n({cm_perc[1, 1]:.1%})"]
+    ]
 
-            mean_series = np.mean(padded, axis=0)
-            plt.plot(range(1, max_len + 1), mean_series, label=name, color=color, linestyle=ls, linewidth=2)
+    sns.heatmap(cm_perc, annot=annot, fmt="", cmap='Blues',
+                xticklabels=labels, yticklabels=labels, cbar=True)
 
-        plt.title(f"Comparison: {label}", fontsize=14)
-        plt.xlabel("Epochs")
-        plt.ylabel(label)
-        plt.legend(fontsize=9)
+    plt.title(f"Average Confusion Matrix\nSzenario: {scenario_name}")
+    plt.ylabel('Ground Truth')
+    plt.xlabel('VQC Vorhersage')
 
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, 'MASTER_COMPARISON_PLOT.png'), dpi=300)
+    plt.savefig(os.path.join(save_dir, 'average_confusion_matrix.png'), dpi=300)
     plt.close()
+    print(f"Average Confusion Matrix für {scenario_name} gespeichert.")
+
+
+def plot_master_comparison(all_results, save_dir):
+    """
+    Erstellt einen Balkendiagramm-Vergleich aller Ablation-Szenarien.
+    all_results: Liste von Dicts mit 'scenario', 'mean_acc', 'std_acc'
+    """
+    # Daten in DataFrame umwandeln
+    df = pd.DataFrame(all_results)
+
+    # Sortieren für bessere Optik (optional)
+    df = df.sort_values(by='mean_acc', ascending=False)
+
+    plt.figure(figsize=(12, 7))
+    sns.set_style("whitegrid")
+
+    # Balkendiagramm mit Fehlerbalken
+    bars = plt.bar(df['scenario'], df['mean_acc'] * 100,
+                   yerr=df['std_acc'] * 100,
+                   capsize=10, color='skyblue', edgecolor='navy', alpha=0.8)
+
+    # Werte über die Balken schreiben
+    for bar in bars:
+        yval = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width() / 2, yval + 1,
+                 f'{yval:.1f}%', ha='center', va='bottom', fontweight='bold')
+
+    plt.xticks(rotation=45, ha='right')
+    plt.ylabel('Test Accuracy (%)')
+    plt.xlabel('Experimentelles Szenario')
+    plt.title('Ablationsstudie: Vergleich der VQC-Architekturen (PneumoniaMNIST)')
+
+    # 74% Referenzlinie (Majority Class Bias)
+    plt.axhline(y=74.0, color='red', linestyle='--', label='Majority Class Baseline (74%)')
+
+    plt.legend()
+    plt.tight_layout()
+
+    plt.savefig(os.path.join(save_dir, "master_ablation_comparison.png"))
+    plt.close()
+
+    # Tabelle als CSV speichern für die Thesis-Anhänge
+    df[['scenario', 'mean_acc', 'std_acc']].to_csv(
+        os.path.join(save_dir, "ablation_results_table.csv"), index=False
+    )
+    print(f"Master-Vergleich gespeichert in {save_dir}")
 
 
 def plot_test_accuracy_distribution(test_accs, results_dir):
@@ -126,7 +163,7 @@ def plot_prediction_histogram(model, data_loader, save_path, device):
 def log_sample_predictions(model, data_loader, save_path, device, num_batches=5):
     """Speichert Samples für die Error-Visualisierung."""
     model.eval()
-    criterion = nn.BCEWithLogitsLoss(reduction='none')
+    criterion = nn.BCELoss(reduction='none')
     with open(save_path, "w") as f:
         f.write("Sample\tPrediction\tGroundTruth\tIndiv_Loss\n")
         with torch.no_grad():
@@ -150,7 +187,7 @@ def visualize_top_errors(log_file_path, raw_dataset, num_samples=3, save_path=No
         plt.subplot(1, num_samples, i + 1)
         plt.imshow(np.array(img), cmap='gray')
         pred, gt = row['Prediction'], row['GroundTruth']
-        color = 'green' if (pred > 0 and gt == 1) or (pred <= 0 and gt == 0) else 'red'
+        color = 'green' if (pred >= 0.5 and gt == 1) or (pred < 0.5 and gt == 0) else 'red'
         plt.title(f"Pred: {pred:.2f} | GT: {int(gt)}\nLoss: {row['Indiv_Loss']:.3f}", color=color)
         plt.axis('off')
     if save_path: plt.savefig(save_path, dpi=300)

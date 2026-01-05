@@ -1,30 +1,54 @@
 import torch
 import os
 
-# System & Pfade
+# --- System & Pfade ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-RESULTS_DIR = '/Users/paulkreppold/bachelor_thesis/VQC_PCA_DataReUploading_48feats'
-
-# Verzeichnis erstellen, falls nicht vorhanden
+RESULTS_DIR = '/Users/paulkreppold/bachelor_thesis/new_ablation_study_for_PCA_&_AngleEncoding'
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
-# Statistik & Training
+# --- Statistik & Training ---
 SEEDS = [42, 1337, 2024]
 BATCH_SIZE = 32
-NUM_EPOCHS = 100
-LR = 0.001  # Eventuell auf 0.005 - 0.01 erhöhen, da kein Scaling-Parameter vorhanden ist
+NUM_EPOCHS = 50
+LR = 0.001
 
-# Quanten-Architektur (Data Re-Uploading Setup)
-NUM_QUBITS = 6
-NUM_FEATURES = 48  # Erhöht auf 48 Komponenten für bessere Bild-Repräsentation
+# --- ABLATION SCENARIOS ---
+# Erläuterung der Parameter:
+# 'weighted': Bestraft Fehler bei Klasse 0 (Gesund) stärker (hilft gegen 0.4-Loss-Plateau).
+# 'trainable_enc': Modell lernt Feature-Importance (w*x + b).
+# 'measurement': 'mean' (lokale Observablen) vs 'first' (globale Observable).
+ABLATION_SCENARIOS = [
+    # 1. Baseline & Qubit-Variation
+    {"name": "Q4_Base", "qubits": 4, "features": 48, "layers": 1, "encoding": "dense", "type": "strongly_entangling",
+     "reuploading": True, "weighted": False, "trainable_enc": False, "measurement": "mean"},
+    {"name": "Q6_Base", "qubits": 6, "features": 48, "layers": 1, "encoding": "dense", "type": "strongly_entangling",
+     "reuploading": True, "weighted": False, "trainable_enc": False, "measurement": "mean"},
+    {"name": "Q8_Base", "qubits": 8, "features": 48, "layers": 1, "encoding": "dense", "type": "strongly_entangling",
+     "reuploading": True, "weighted": False, "trainable_enc": False, "measurement": "mean"},
 
-# Bestimmt, wie viele Features pro Qubit-Paar (RY/RZ) geladen werden
-FEATURES_PER_BLOCK = NUM_QUBITS * 2
+    # 2. Re-Uploading Check (Fair Comparison)
+    {"name": "Q6_NoReupload_12f", "qubits": 6, "features": 12, "layers": 1, "encoding": "dense",
+     "type": "strongly_entangling", "reuploading": False, "weighted": False, "trainable_enc": False,
+     "measurement": "mean"},
+    {"name": "Q6_StandardEnc_48f", "qubits": 6, "features": 48, "layers": 1, "encoding": "standard",
+     "type": "strongly_entangling", "reuploading": True, "weighted": False, "trainable_enc": False,
+     "measurement": "mean"},
 
-# Anzahl der Upload-Zyklen (hier: 48 / 12 = 4 Blöcke)
-NUM_BLOCKS = NUM_FEATURES // FEATURES_PER_BLOCK
+    # 3. Mess-Strategie (Global vs. Lokal)
+    {"name": "Q6_Measure_FirstOnly", "qubits": 6, "features": 48, "layers": 1, "encoding": "dense",
+     "type": "strongly_entangling", "reuploading": True, "weighted": False, "trainable_enc": False,
+     "measurement": "first"},
 
-# Variational Layers pro Block (entspricht der Tiefe nach jedem Upload)
-LAYERS_PER_BLOCK = 4
+    # 4. Die "Loss-Knacker" (Ziel: < 0.4 Loss)
+    {"name": "Q6_WeightedLoss", "qubits": 6, "features": 48, "layers": 1, "encoding": "dense",
+     "type": "strongly_entangling", "reuploading": True, "weighted": True, "trainable_enc": False,
+     "measurement": "mean"},
+    {"name": "Q6_TrainableEncoding", "qubits": 6, "features": 48, "layers": 1, "encoding": "dense",
+     "type": "strongly_entangling", "reuploading": True, "weighted": False, "trainable_enc": True,
+     "measurement": "mean"},
 
-# Hinweis: Die Gesamtzahl der trainierbaren Schichten ist NUM_BLOCKS * LAYERS_PER_BLOCK
+    # 5. Maximal-Modell
+    {"name": "Q6_L2_Weighted_Trainable", "qubits": 6, "features": 48, "layers": 2, "encoding": "dense",
+     "type": "strongly_entangling", "reuploading": True, "weighted": True, "trainable_enc": True,
+     "measurement": "mean"},
+]

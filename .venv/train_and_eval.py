@@ -1,14 +1,15 @@
 import torch
 import numpy as np
 from sklearn.metrics import confusion_matrix
-import torch
-import numpy as np
-from sklearn.metrics import confusion_matrix
 
-def train_model(model, train_loader, val_loader, optimizer, criterion, scheduler, epochs, seed, device):
+
+def train_model(model, train_loader, val_loader, optimizer, criterion, scheduler, epochs, seed, device,
+                is_weighted=False):
     """
-    Trainings-Loop angepasst für Wahrscheinlichkeits-Outputs (0 bis 1).
-    Wichtig: 'criterion' sollte nn.BCELoss() sein.
+    Trainings-Loop angepasst für:
+    - Wahrscheinlichkeits-Outputs (0 bis 1)
+    - Optionalen Weighted BCELoss (Klassengewichtung gegen Bias)
+    - Early Stopping basierend auf LR-Threshold
     """
     history = {'loss': [], 'acc': [], 'val_loss': [], 'val_acc': [], 'lr': []}
     min_lr_threshold = 1.1e-5
@@ -19,28 +20,35 @@ def train_model(model, train_loader, val_loader, optimizer, criterion, scheduler
         current_lr = optimizer.param_groups[0]['lr']
 
         for inputs, targets in train_loader:
-            # Targets für BCE vorbereiten (N, 1)
             targets = targets.to(device).float().view(-1, 1)
             inputs = inputs.to(device)
 
             optimizer.zero_grad()
-            outputs = model(inputs) # Output ist jetzt im Bereich [0, 1]
+            outputs = model(inputs)
 
-            # BCELoss berechnen
-            loss = criterion(outputs, targets)
+            # --- LOSS BERECHNUNG ---
+            if is_weighted:
+                # BCELoss muss hier mit reduction='none' initialisiert sein
+                raw_loss = criterion(outputs, targets)
+                # Gewichtung: Klasse 0 (Gesund) bekommt ca. 2.8, Klasse 1 (Krank) 1.0
+                weights = torch.where(targets == 0, 2.8, 1.0).to(device)
+                loss = (raw_loss * weights).mean()
+            else:
+                loss = criterion(outputs, targets)
+
             loss.backward()
             optimizer.step()
 
-            # Accuracy: Schwellenwert 0.5, da wir Wahrscheinlichkeiten haben
+            # Accuracy (Schwellenwert 0.5)
             preds = (outputs >= 0.5).float()
             correct += (preds == targets).sum().item()
             total += targets.size(0)
             running_loss += loss.item() * inputs.size(0)
 
-        # Evaluation nach der Epoche
-        val_loss, val_acc, cm = evaluate_model(model, val_loader, criterion, device)
+        # Validierung nach der Epoche
+        val_loss, val_acc, cm = evaluate_model(model, val_loader, criterion, device, is_weighted=is_weighted)
 
-        # LR Scheduler Update
+        # LR Scheduler Update (basiert auf Val-Loss)
         scheduler.step(val_loss)
 
         train_loss = running_loss / total
@@ -59,7 +67,7 @@ def train_model(model, train_loader, val_loader, optimizer, criterion, scheduler
             f"LR: {current_lr:.6f}"
         )
 
-        # Early Stopping Check
+        # Early Stopping Check (wenn die LR zu weit sinkt, lernt das Modell nichts mehr)
         next_lr = optimizer.param_groups[0]['lr']
         if next_lr < min_lr_threshold:
             print(f"\n[Early Stopping] Seed {seed}: LR {next_lr:.7f} unterschritten.")
@@ -68,9 +76,11 @@ def train_model(model, train_loader, val_loader, optimizer, criterion, scheduler
     return history
 
 
-def evaluate_model(model, data_loader, criterion, device):
+def evaluate_model(model, data_loader, criterion, device, is_weighted=False):
     """
-    Evaluations-Loop angepasst für Wahrscheinlichkeits-Outputs (0 bis 1).
+    Evaluations-Loop:
+    - Robust gegenüber skalaren und vektorisierten Loss-Funktionen (weighted)
+    - Berechnet Confusion Matrix für finale Analyse
     """
     model.eval()
     running_loss, correct, total = 0.0, 0, 0
@@ -82,10 +92,18 @@ def evaluate_model(model, data_loader, criterion, device):
             inputs = inputs.to(device)
 
             outputs = model(inputs)
-            loss = criterion(outputs, targets_bce)
+
+            # --- LOSS BERECHNUNG (Analog zum Training) ---
+            if is_weighted:
+                raw_loss = criterion(outputs, targets_bce)
+                weights = torch.where(targets_bce == 0, 2.8, 1.0).to(device)
+                loss = (raw_loss * weights).mean()
+            else:
+                loss = criterion(outputs, targets_bce)
+
             running_loss += loss.item() * inputs.size(0)
 
-            # Accuracy: Schwellenwert 0.5
+            # Vorhersagen (0.5 Schwellenwert)
             preds = (outputs >= 0.5).float()
 
             correct += (preds == targets_bce).sum().item()
@@ -94,5 +112,8 @@ def evaluate_model(model, data_loader, criterion, device):
             all_preds.extend(preds.cpu().numpy().flatten())
             all_targets.extend(targets.numpy().flatten())
 
+    avg_loss = running_loss / total
+    avg_acc = correct / total
     cm = confusion_matrix(all_targets, all_preds, labels=[0, 1])
-    return running_loss / total, correct / total, cm
+
+    return avg_loss, avg_acc, cm
