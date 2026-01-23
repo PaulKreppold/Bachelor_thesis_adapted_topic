@@ -42,7 +42,7 @@ def main():
         ).to(config.DEVICE)
 
         optimizer = torch.optim.Adam(model.parameters(), lr=config.LR)
-        criterion = torch.nn.MSELoss()
+        criterion = torch.nn.BCELoss()
 
         # Training
         history, final_val_cm = train_model(
