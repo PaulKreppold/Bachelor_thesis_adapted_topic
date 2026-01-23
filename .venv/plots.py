@@ -1,242 +1,402 @@
-import matplotlib.pyplot as plt
 import seaborn as sns
-import numpy as np
 import pandas as pd
+import numpy as np
 import os
-import torch
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FormatStrFormatter
 
+GLOBAL_PALETTE = {
+    "Lokale Baseline": "#D55E00",
+    "QFL": "#0072B2",
+    "Zentrale Baseline": "#009E73"
+}
 
-def plot_averaged_results(all_histories, save_dir):
-    """
-    Plottet den Durchschnitt und die Standardabweichung von Loss und Accuracy
-    über alle Seeds hinweg für das finale Modell.
-    """
-    max_epochs = max(len(h['loss']) for h in all_histories)
-    plt.figure(figsize=(12, 5))
+NOISE_COLOR_MAP = {
+    "bitflip": "#E69F00",
+    "phaseflip": "#56B4E9",
+    "depolarizing": "#CC79A7",
+    "None": "#000000"
+}
 
-    # Metriken: (Train-Key, Val-Key, Label, Subplot-Index)
-    metrics = [('loss', 'val_loss', 'BCE Loss', 1),
-               ('acc', 'val_acc', 'Accuracy', 2)]
+SCENARIO_MAP = {
+    'Zentrale Baseline': 'Zentrale Baseline',
+    'Lokale Baseline': 'Lokale Baseline',
+    'QFL': 'QFL'
+}
 
-    for train_key, val_key, label, idx in metrics:
-        plt.subplot(1, 2, idx)
-        for key, col, name in [(train_key, 'blue', 'Train'), (val_key, 'orange', 'Val')]:
-            padded_data = []
-            for h in all_histories:
-                series = list(h[key])
-                # Padding, falls ein Seed durch Early Stopping kürzer lief
-                if len(series) < max_epochs:
-                    last_val = series[-1]
-                    series.extend([last_val] * (max_epochs - len(series)))
-                padded_data.append(series)
+LABEL_MAP = {
+    'client_1': 'PneumoniaMNIST',
+    'client_2': 'RSNA (60/40)',
+    'client_3': 'RSNA (40/60)',
+    'client_4': 'CheXpert (25/75)'
+}
 
-            data = np.array(padded_data)
-            mean = np.mean(data, axis=0)
-            std = np.std(data, axis=0)
-            epochs_range = range(1, max_epochs + 1)
+def setup_german_plot_style():
+    sns.set_theme(style="white")
+    plt.rcParams.update({
+        'axes.titlesize': 14,
+        'axes.labelsize': 12,
+        'xtick.labelsize': 10,
+        'ytick.labelsize': 10,
+        'legend.fontsize': 9,
+        'figure.titlesize': 16,
+        'font.family': 'sans-serif',
+        'axes.grid': False,
+        'axes.spines.top': True,
+        'axes.spines.right': True,
+        'axes.edgecolor': 'black',
+        'axes.linewidth': 1.0
+    })
 
-            plt.plot(epochs_range, mean, label=f'{name} {label}', color=col, linewidth=2)
-            plt.fill_between(epochs_range, mean - std, mean + std, color=col, alpha=0.15)
+def format_y_axis(ax, precision=2):
+    #Fixiert die Nachkommastellen der Y-Achse
+    formatter = FormatStrFormatter(f'%.{precision}f')
+    ax.yaxis.set_major_formatter(formatter)
 
-        plt.title(f'Mean {label} (über alle Seeds)')
-        plt.xlabel('Epochen')
-        plt.ylabel(label)
-        plt.legend()
-        plt.grid(True, alpha=0.3)
+def apply_clear_boxplot_style(ax):
+    #Erzeugt transparente Boxen mit farbigen Rändern
+    for i, artist in enumerate(ax.patches):
+        col = artist.get_facecolor()
+        artist.set_facecolor('none')
+        artist.set_edgecolor(col)
+        artist.set_linewidth(1.5)
 
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, 'training_curves.png'), dpi=300)
-    plt.close()
+def get_noise_label(noise_type, p):
+    #Erstellt eine saubere Beschriftung für Rauschszenarien
+    nt = "Depolarizing Kanal" if noise_type == "depolarizing" else noise_type
+    if str(noise_type) == "None" or p == 0:
+        return "Szenario ohne Rauschen"
+    return f"Rauschen: {nt} (p={p})"
 
+# 1. TRAININGS- & KONVERGENZANALYSE
 
-def plot_average_confusion_matrix(scenario_metrics, scenario_name, save_dir):
-    """Visualisiert die Performance bei der Erkennung beider Klassen (Normal/Pneumonie)."""
-    all_cms = [m['cm'] for m in scenario_metrics]
-    avg_cm = np.mean(all_cms, axis=0)
-    cm_perc = avg_cm.astype('float') / avg_cm.sum(axis=1)[:, np.newaxis]
-
-    plt.figure(figsize=(8, 6))
-    labels = ['Gesund (0)', 'Pneumonie (1)']
-    annot = [
-        [f"{avg_cm[0, 0]:.1f}\n({cm_perc[0, 0]:.1%})", f"{avg_cm[0, 1]:.1f}\n({cm_perc[0, 1]:.1%})"],
-        [f"{avg_cm[1, 0]:.1f}\n({cm_perc[1, 0]:.1%})", f"{avg_cm[1, 1]:.1f}\n({cm_perc[1, 1]:.1%})"]
+def plot_training_comparison(histories_baseline, histories_qfl_high_res, title, save_path):
+    #Plottet den Mittelwert der Trainingsphase über alle Teilnehmer und Seeds
+    setup_german_plot_style()
+    plt.figure(figsize=(14, 7))
+    metrics = [
+        ('acc', 'Trainingsgenauigkeit', 1),
+        ('loss', 'Trainingsverlust', 2)
     ]
-
-    sns.heatmap(cm_perc, annot=annot, fmt="", cmap='Blues',
-                xticklabels=labels, yticklabels=labels, cbar=True)
-
-    plt.title(f"Durchschnittliche Confusion Matrix\nModell: {scenario_name}")
-    plt.ylabel('Tatsächliche Klasse')
-    plt.xlabel('VQC Vorhersage')
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, 'average_confusion_matrix.png'), dpi=300)
-    plt.close()
-
-
-def plot_test_accuracy_distribution(test_accs, results_dir):
-    """Zeigt die statistische Varianz der Test-Accuracy über die Seeds (Boxplot)."""
-    plt.figure(figsize=(6, 8))
-    data = [acc * 100 for acc in test_accs]
-    sns.set_theme(style="whitegrid")
-
-    # Kombination aus Boxplot und Stripplot für maximale Transparenz
-    sns.boxplot(y=data, width=0.5, color='#a3c1ad')
-    sns.stripplot(y=data, color="#2a4d34", size=8, jitter=True)
-
-    plt.title("Verteilung der Test-Accuracy", fontsize=14)
-    plt.ylabel("Accuracy (%)")
-    plt.ylim(0, 105)
-    plt.tight_layout()
-    plt.savefig(os.path.join(results_dir, "test_accuracy_boxplot.png"), dpi=300)
-    plt.close()
-
-
-def plot_prediction_histogram(model, data_loader, save_path, device):
-    """Zeigt die Konfidenz-Verteilung der Wahrscheinlichkeiten (0.0 bis 1.0)."""
-    model.eval()
-    preds = []
-    with torch.no_grad():
-        for x, _ in data_loader:
-            out = model(x.to(device))
-            preds.extend(out.cpu().numpy().ravel())
-
-    plt.figure(figsize=(8, 5))
-    plt.hist(preds, bins=30, color="#4c72b0", edgecolor="black", alpha=0.8)
-    # WICHTIG: Threshold bei 0.5 für Wahrscheinlichkeiten
-    plt.axvline(x=0.5, color='red', linestyle='--', label='Entscheidungsgrenze (0.5)')
-
-    plt.title("Verteilung der Vorhersage-Wahrscheinlichkeiten")
-    plt.xlabel("Wahrscheinlichkeit (0.0=Gesund, 1.0=Pneumonie)")
-    plt.ylabel("Häufigkeit")
-    plt.xlim(0, 1)
-    plt.legend()
+    for key, label, idx in metrics:
+        ax = plt.subplot(1, 2, idx)
+        if histories_qfl_high_res:
+            all_curves = [h[f'train_{key}'] for h in histories_qfl_high_res]
+            max_e = max(len(c) for c in all_curves)
+            matrix = np.full((len(all_curves), max_e), np.nan)
+            for i, c in enumerate(all_curves):
+                matrix[i, :len(c)] = c
+            mean_curve = np.nanmean(matrix, axis=0)
+            plt.plot(
+                np.arange(1, max_e + 1),
+                mean_curve,
+                label='QFL (Ø über alle Teilnehmer)',
+                color=GLOBAL_PALETTE['QFL'],
+                lw=2
+            )
+        if histories_baseline:
+            all_b = [h[f'train_{key}'] for h in histories_baseline]
+            max_b = max(len(c) for c in all_b)
+            matrix_b = np.full((len(all_b), max_b), np.nan)
+            for i, c in enumerate(all_b):
+                matrix_b[i, :len(c)] = c
+            mean_b = np.nanmean(matrix_b, axis=0)
+            plt.plot(
+                np.arange(1, max_b + 1),
+                mean_b,
+                label='Lokale Baseline',
+                color=GLOBAL_PALETTE['Lokale Baseline'],
+                lw=1.5,
+                alpha=0.7
+            )
+        ax.set_title(f'Verlauf: {label}', fontweight='bold')
+        ax.set_xlabel('Epochen')
+        ax.set_ylabel(label)
+        ax.legend(frameon=False)
+        ax.grid(True, linestyle=':', alpha=0.5)
+        format_y_axis(ax)
+    plt.suptitle(f"Trainingsverlauf ({title})", fontweight='bold', fontsize=16, y=0.98)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.savefig(save_path, dpi=300)
     plt.close()
 
-
-def save_final_statistics(metrics, save_dir):
-    """Speichert die finalen statistischen Kennzahlen in einer Textdatei."""
-    accs = [m['acc'] * 100 for m in metrics]
-    losses = [m['loss'] for m in metrics]
-
-    mean_acc = np.mean(accs)
-    std_acc = np.std(accs)
-    mean_loss = np.mean(losses)
-
-    stats_path = os.path.join(save_dir, "final_statistics.txt")
-    with open(stats_path, "w") as f:
-        f.write("=== Finale Statistik des Super-Modells ===\n")
-        f.write(f"Test Accuracy: {mean_acc:.2f}% (+/- {std_acc:.2f}%)\n")
-        f.write(f"Durchschnittlicher Test Loss: {mean_loss:.4f}\n")
-        f.write(f"Anzahl Seeds: {len(metrics)}\n")
-
-    print(f"\n[Statistik] Finale Kennzahlen gespeichert: {stats_path}")
-    print(f"Ergebnis: {mean_acc:.2f}% (+/- {std_acc:.2f}%)")
-
-
-def save_raw_results(all_histories, all_metrics, save_dir):
-    """Speichert Rohdaten als .npy, damit der globale Plotter darauf zugreifen kann."""
-    # Durchschnittliche Historie berechnen
-    max_epochs = max(len(h['loss']) for h in all_histories)
-    avg_history = {}
-    for key in ['loss', 'acc', 'val_loss', 'val_acc']:
-        data = []
-        for h in all_histories:
-            series = list(h[key])
-            if len(series) < max_epochs:
-                series.extend([series[-1]] * (max_epochs - len(series)))
-            data.append(series)
-        avg_history[key] = np.mean(data, axis=0)
-
-    # Speichern der Durchschnitts-Historie
-    np.save(os.path.join(save_dir, 'avg_history.npy'), avg_history)
-
-    # Speichern aller Test-Accuracies der Seeds (für Boxplot)
-    test_accs = [m['acc'] for m in all_metrics]
-    np.save(os.path.join(save_dir, 'test_accs.npy'), test_accs)
-
-    # Speichern der gemittelten Confusion Matrix
-    avg_cm = np.mean([m['cm'] for m in all_metrics], axis=0)
-    np.save(os.path.join(save_dir, 'avg_cm.npy'), avg_cm)
-
-
-def plot_global_comparison(results_root, layer_configs, init_methods):
-    """Erstellt den großen Vergleich über alle Experimente."""
-    all_box_data = []
-    plt.figure(figsize=(15, 10))
-    fig_line, (ax_loss, ax_acc) = plt.subplots(1, 2, figsize=(16, 6))
-
-    for layers in layer_configs:
-        for init in init_methods:
-            exp_name = f"Layers_{layers}_Init_{init}"
-            path = os.path.join(results_root, exp_name)
-
-            if not os.path.exists(os.path.join(path, 'avg_history.npy')):
-                continue
-
-            # 1. Daten für Boxplot sammeln
-            accs = np.load(os.path.join(path, 'test_accs.npy'))
-            for a in accs:
-                all_box_data.append({'Layers': layers, 'Init': init, 'Test Acc': a * 100})
-
-            # 2. Daten für Liniendiagramme
-            hist = np.load(os.path.join(path, 'avg_history.npy'), allow_pickle=True).item()
-            label = f"L{layers}-{init}"
-            ax_loss.plot(hist['loss'], label=label, alpha=0.7)
-            ax_acc.plot(hist['acc'], label=label, alpha=0.7)
-
-    # Styling Liniendiagramme
-    ax_loss.set_title("Globaler Train Loss Vergleich")
-    ax_loss.set_xlabel("Epoche");
-    ax_loss.set_ylabel("BCE Loss")
-    ax_loss.legend(fontsize='x-small', ncol=2)
-    ax_acc.set_title("Globaler Train Accuracy Vergleich")
-    ax_acc.set_xlabel("Epoche");
-    ax_acc.set_ylabel("Accuracy")
-    fig_line.tight_layout()
-    fig_line.savefig(os.path.join(results_root, "global_training_comparison.png"))
-
-    # Styling Boxplot
-    plt.figure(figsize=(12, 7))
-    df = pd.DataFrame(all_box_data)
-    sns.boxplot(x='Layers', y='Test Acc', hue='Init', data=df)
-    plt.title("Test Accuracy Vergleich: Layer-Tiefe vs. Initialisierung")
-    plt.ylabel("Accuracy (%)")
-    plt.grid(True, alpha=0.3)
-    plt.savefig(os.path.join(results_root, "global_test_boxplot.png"))
-    plt.close('all')
-
-
-def plot_global_cm_grid(results_root, layer_configs, init_methods):
-    """Erstellt ein Grid aus Confusion Matrices für alle Varianten."""
-    n_rows = len(layer_configs)
-    n_cols = len(init_methods)
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3, n_rows * 3))
-
-    # Falls nur eine Zeile/Spalte existiert, axes array-kompatibel machen
-    if n_rows == 1: axes = np.expand_dims(axes, axis=0)
-    if n_cols == 1: axes = np.expand_dims(axes, axis=1)
-
-    for i, layers in enumerate(layer_configs):
-        for j, init in enumerate(init_methods):
-            exp_name = f"Layers_{layers}_Init_{init}"
-            path = os.path.join(results_root, exp_name, 'avg_cm.npy')
-
-            ax = axes[i, j]
-            if os.path.exists(path):
-                cm = np.load(path)
-                # Normalisieren für Farbgebung
-                cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
-                sns.heatmap(cm_norm, annot=True, fmt=".2f", cmap="Blues", cbar=False, ax=ax)
-                ax.set_title(f"L{layers} - {init}", fontsize=10)
-            else:
-                ax.axis('off')
-            ax.set_xticks([]);
-            ax.set_yticks([])
-
-    plt.suptitle("Confusion Matrix Vergleich (normalisiert)", fontsize=16)
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.savefig(os.path.join(results_root, "global_cm_grid.png"))
+def plot_convergence_speed_comparison(histories_baseline, histories_qfl, save_dir):
+    #Analysiert die benötigten Epochen bis zum Erreichen von 95% der Endgenauigkeit
+    setup_german_plot_style()
+    convergence_data = []
+    def get_conv_epoch(history, key='train_acc'):
+        curve = history.get(key, [])
+        if len(curve) == 0:
+            return None
+        final_val = curve[-1]
+        threshold = 0.95 * final_val
+        for i, val in enumerate(curve):
+            if val >= threshold:
+                return i + 1
+        return len(curve)
+    for h in histories_qfl:
+        ep = get_conv_epoch(h, 'train_acc')
+        if ep:
+            convergence_data.append({'Szenario': 'QFL', 'Epochen': ep})
+    for h in histories_baseline:
+        ep = get_conv_epoch(h, 'train_acc')
+        if ep:
+            convergence_data.append({'Szenario': 'Lokale Baseline', 'Epochen': ep})
+    df = pd.DataFrame(convergence_data)
+    plt.figure(figsize=(10, 6))
+    ax = sns.boxplot(
+        data=df, x='Szenario', y='Epochen',
+        palette=GLOBAL_PALETTE, width=0.4
+    )
+    ax.set_title("Verzögerung der Konvergenzgeschwindigkeit durch Rauschen", fontweight='bold')
+    ax.set_ylabel("Epochen bis zum Erreichen von 95% der Endgenauigkeit")
+    ax.set_xlabel("Untersuchtes Szenario")
+    format_y_axis(ax, precision=0)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "Konvergenz_Verzoegerung_Boxplot.png"), dpi=300)
     plt.close()
 
+# 2. GLOBALER PERFORMANCE-VERGLEICH
+
+def plot_global_comparison_summary(df, save_dir):
+    #Boxplot für den globalen Vergleich der Testgenauigkeit
+    setup_german_plot_style()
+    plt.figure(figsize=(10, 6))
+    ax = sns.boxplot(
+        data=df, x='Szenario', y='Testgenauigkeit', hue='Szenario',
+        legend=False, order=["Zentrale Baseline", "Lokale Baseline", "QFL"],
+        palette=GLOBAL_PALETTE, width=0.35, showmeans=True,
+        meanprops={"marker": "o", "markerfacecolor": "white", "markeredgecolor": "black"}
+    )
+    apply_clear_boxplot_style(ax)
+    noise_label = get_noise_label(df['Noise_Type'].iloc[0], df['Noise_P'].iloc[0])
+    ax.set_title(f"Globaler Vergleich der Testgenauigkeit\n({noise_label})")
+    ax.set_ylabel("Testgenauigkeit")
+    format_y_axis(ax)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "Global_Summary_Boxplot.png"), dpi=300)
+    plt.close()
+
+def plot_paper_style_boxplot(df, save_dir):
+    #Aufgeschlüsselter Boxplot nach klinischen Domänen
+    setup_german_plot_style()
+    df_plot = df.copy()
+    df_plot['Domäne'] = df_plot['Client'].map(LABEL_MAP)
+    plt.figure(figsize=(13, 7))
+    ax = sns.boxplot(
+        data=df_plot, x='Domäne', y='Testgenauigkeit', hue='Szenario',
+        palette=GLOBAL_PALETTE, width=0.55, showmeans=True,
+        meanprops={"marker": "o", "markerfacecolor": "white", "markeredgecolor": "black"}
+    )
+    apply_clear_boxplot_style(ax)
+    noise_label = get_noise_label(df['Noise_Type'].iloc[0], df['Noise_P'].iloc[0])
+    ax.set_title(f"Domänenspezifische Robustheit der Testgenauigkeit ({noise_label})")
+    ax.set_ylabel("Testgenauigkeit")
+    plt.legend(frameon=True, loc='lower right', edgecolor='black')
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "Detailliert_Performance_Boxplot.png"), dpi=300)
+    plt.close()
+
+# 3. LDS RESCUE & ROBUSTHEITS-MATRIZEN
+
+def plot_recall_improvement_lds(df, save_dir):
+    #Visualisiert die Verbesserung des Recall der Minderheitsklasse durch QFL
+    setup_german_plot_style()
+    targets = [('client_1', '1'), ('client_4', '1')]
+    df_lds = df[df.apply(lambda x: (str(x['Client']), str(x['Subclient'])) in targets, axis=1)].copy()
+    if df_lds.empty:
+        return
+    plt.figure(figsize=(10, 6))
+    ax = sns.barplot(
+        data=df_lds, x='Client', y='Recall_Minderheit', hue='Szenario',
+        palette=GLOBAL_PALETTE, width=0.65, capsize=.05
+    )
+    noise_label = get_noise_label(df['Noise_Type'].iloc[0], df['Noise_P'].iloc[0])
+    ax.set_title(f"Minderheiten-Resilienz (LDS-Rettung)\n{noise_label}")
+    ax.set_ylabel("Recall der Minderheitsklasse")
+    ax.set_ylim(0, 1.0)
+    format_y_axis(ax)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "LDS_Rescue_Recall.png"), dpi=300)
+    plt.close()
+
+def plot_noise_rescue_erosion(df_master, save_dir):
+    """Analysiert den Verlust des QFL-Vorteils bei steigendem Rauschen."""
+    setup_german_plot_style()
+    targets = [('client_1', '1'), ('client_4', '1')]
+    df_ext = df_master[df_master.apply(lambda x: (str(x['Client']), str(x['Subclient'])) in targets, axis=1)].copy()
+    qfl = df_ext[df_ext['Szenario'] == 'QFL']
+    loc = df_ext[df_ext['Szenario'] == 'Lokale Baseline']
+    merged = pd.merge(qfl, local, on=['Seed', 'Noise_Type', 'Noise_P', 'Client'], suffixes=('_qfl', '_loc'))
+    merged['Vorteil'] = merged['Recall_Minderheit_qfl'] - merged['Recall_Minderheit_loc']
+    plt.figure(figsize=(10, 6))
+    sns.lineplot(data=merged, x='Noise_P', y='Vorteil', hue='Noise_Type', marker='o', palette=NOISE_COLOR_MAP)
+    plt.axhline(0, color='black', linestyle='--', alpha=0.5)
+    plt.title("Erosion des QFL-Vorteils (LDS-Rettung) unter Rauschen")
+    plt.xlabel("Rauschwahrscheinlichkeit p")
+    plt.ylabel("Differenz Recall (QFL - Lokale Baseline)")
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "Master_LDS_Rescue_Erosion.png"), dpi=300)
+    plt.close()
+
+def plot_skew_noise_heatmap(df_master, save_dir):
+    #Visualisiert das Zusammenspiel von Rauschen und LDS-Heterogenität
+    setup_german_plot_style()
+    df_qfl = df_master[df_master['Szenario'] == 'QFL'].copy()
+    skew_mapping = {
+        'client_1': '0.90 (Extrem)', 'client_4': '0.90 (Extrem)',
+        'client_2': '0.60 (Mild)', 'client_3': '0.60 (Mild)'
+    }
+    df_qfl['LDS_Skew'] = df_qfl['Client'].map(skew_mapping)
+    pivot = df_qfl.pivot_table(index='LDS_Skew', columns='Noise_P', values='Testgenauigkeit', aggfunc='mean')
+    plt.figure(figsize=(10, 5))
+    sns.heatmap(pivot, annot=True, cmap="YlGnBu", fmt=".2f")
+    plt.title("Robustheits-Matrix: LDS Skew vs. Rauschen (QFL)")
+    plt.xlabel("Rauschwahrscheinlichkeit p")
+    plt.ylabel("LDS Skew Stärke")
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "Master_Skew_Noise_Heatmap.png"), dpi=300)
+    plt.close()
+
+# 4. MASTER-ANALYSE ÜBER ALLE RAUSCHLEVEL
+
+def plot_master_noise_sensitivity(df_master, save_dir):
+    """Absturzkurven für QFL und Baseline über ansteigendes Rauschen."""
+    setup_german_plot_style()
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+    metrics = [
+        ('ROC_AUC', 'Trennschärfe (ROC-AUC)'),
+        ('PR_AUC', 'Minderheiten-Resilienz (PR-AUC)')
+    ]
+    for ax, (m, t) in zip(axes, metrics):
+        df_plot = df_master[df_master['Szenario'] != 'Zentrale Baseline']
+        sns.lineplot(
+            data=df_plot, x='Noise_P', y=m, hue='Noise_Type',
+            style='Szenario', palette=NOISE_COLOR_MAP, marker='o', lw=2, ax=ax
+        )
+        ax.set_title(t)
+        ax.set_xlabel("Rauschwahrscheinlichkeit p")
+        format_y_axis(ax)
+    plt.suptitle("Absturzkurven: Performance-Vergleich unter Rauschen", fontweight='bold')
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig(os.path.join(save_dir, "Master_Noise_Sensitivitaet.png"), dpi=300)
+    plt.close()
+
+def plot_noise_type_impact_ranking(df_master, save_dir):
+    #Ranking der Rauschtypen basierend auf dem Genauigkeitsverlust
+    setup_german_plot_style()
+    ref = df_master[df_master['Noise_P'] == 0]
+    baseline_perf = ref.groupby('Szenario')['Testgenauigkeit'].mean()
+    impact_data = []
+    noise_types = [nt for nt in NOISE_COLOR_MAP.keys() if nt != "None"]
+    for scenario in ['QFL', 'Lokale Baseline']:
+        for nt in noise_types:
+            df_noise = df_master[(df_master['Szenario'] == scenario) & (df_master['Noise_Type'] == nt)]
+            if not df_noise.empty:
+                avg_perf = df_noise[df_noise['Noise_P'] > 0]['Testgenauigkeit'].mean()
+                loss = baseline_perf[scenario] - avg_perf
+                impact_data.append({
+                    'Szenario': scenario, 'Rauschtyp': nt, 'Genauigkeitsverlust': loss
+                })
+    df_impact = pd.DataFrame(impact_data)
+    plt.figure(figsize=(10, 6))
+    ax = sns.barplot(
+        data=df_impact, x='Rauschtyp', y='Genauigkeitsverlust',
+        hue='Szenario', palette=GLOBAL_PALETTE
+    )
+    ax.set_title("Ranking der Rauschtypen nach Leistungsverlust", fontweight='bold')
+    ax.set_ylabel("Durchschnittlicher Verlust der Testgenauigkeit")
+    ax.set_xlabel("Art des Quantenrauschens")
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "Ranking_Rauschschaden.png"), dpi=300)
+    plt.close()
+
+def plot_critical_thresholds_annotated(df_master, save_dir):
+    #Absturzkurven mit Markierung der kritischen 10%-Verlustmarke
+    setup_german_plot_style()
+    plt.figure(figsize=(12, 7))
+    df_qfl = df_master[df_master['Szenario'] == 'QFL']
+    df_p0 = df_qfl[df_qfl['Noise_P'] == 0]
+    if df_p0.empty:
+        return
+    p0_val = df_p0['Testgenauigkeit'].mean()
+    limit = p0_val * 0.90
+    noise_types = [nt for nt in NOISE_COLOR_MAP.keys() if nt != "None"]
+    for nt in noise_types:
+        df_nt = df_qfl[df_qfl['Noise_Type'] == nt]
+        stats = df_nt.groupby('Noise_P')['Testgenauigkeit'].mean()
+        plt.plot(stats.index, stats.values, marker='o', label=nt, linewidth=2)
+        critical_p = stats[stats < limit].index.min()
+        if not pd.isna(critical_p):
+            plt.axvline(x=critical_p, linestyle='--', alpha=0.3, color='gray')
+    plt.axhline(y=limit, color='red', linestyle=':', alpha=0.6, label='Kritische Grenze (-10%)')
+    plt.title("Analyse der kritischen Rauschgrenzen für den QFL-Leistungseinbruch", fontweight='bold')
+    plt.xlabel("Rauschwahrscheinlichkeit p")
+    plt.ylabel("Testgenauigkeit (QFL)")
+    plt.legend(frameon=True, loc='best')
+    format_y_axis(plt.gca())
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "Kritische_Rauschschwellen.png"), dpi=300)
+    plt.close()
+
+def plot_stability_analysis(df_master, save_dir):
+    #Analysiert die Standardabweichung
+    setup_german_plot_style()
+    stability_df = df_master.groupby(['Szenario', 'Noise_Type', 'Noise_P'])['Balancierte_Genauigkeit'].std().reset_index()
+    stability_df.rename(columns={'Balancierte_Genauigkeit': 'Std_Dev'}, inplace=True)
+    stability_df = stability_df[stability_df['Szenario'].isin(['Lokale Baseline', 'QFL'])]
+    plt.figure(figsize=(10, 6))
+    sns.lineplot(
+        data=stability_df, x='Noise_P', y='Std_Dev', hue='Szenario',
+        style='Noise_Type', palette=GLOBAL_PALETTE, marker='o', lw=2, markersize=8
+    )
+    plt.title("Stabilitäts-Analyse: Varianz der Ergebnisse unter Rauschen", fontweight='bold')
+    plt.xlabel("Rauschwahrscheinlichkeit p")
+    plt.ylabel(r"Standardabweichung $\sigma$")
+    plt.legend(frameon=True, title="Szenario / Rauschtyp", bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "Master_Stabilitat_Varianz.png"), dpi=300)
+    plt.close()
+
+def plot_noise_evolution_convergence(evolution_data, noise_type, save_dir):
+    #Vergleicht die Konvergenzverzögerung über p
+    setup_german_plot_style()
+    plt.figure(figsize=(10, 6))
+    p_colors = {0.0: "black", 0.01: "#56B4E9", 0.05: "#E69F00", 0.1: "#D55E00"}
+    for p_val, history in evolution_data.items():
+        if history is not None:
+            x_axis = np.arange(1, len(history['acc']) + 1) * 3
+            label = f"p = {p_val} (Referenz)" if p_val == 0 else f"p = {p_val}"
+            plt.plot(
+                x_axis, history['acc'], label=label,
+                color=p_colors.get(p_val, "gray"), lw=2,
+                marker='o' if p_val > 0 else None, markersize=4
+            )
+    plt.title(f"Konvergenz-Verzögerung unter {noise_type}-Rauschen", fontweight='bold')
+    plt.xlabel("Epochen")
+    plt.ylabel("Globale Validierungsgenauigkeit")
+    plt.legend(frameon=True, edgecolor='black')
+    plt.grid(True, linestyle=':', alpha=0.6)
+    format_y_axis(plt.gca())
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, f"Evolution_Convergence_{noise_type}.png"), dpi=300)
+    plt.close()
+
+def plot_confusion_matrix_comparison(cm_baseline, cm_qfl, sub_id, save_dir):
+    #Qualitativer Vergleich der Confusion Matrices
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    labels = ['Gesund', 'Pneumonie']
+    for ax, cm, title in zip([ax1, ax2], [cm_baseline, cm_qfl], ['Lokale Baseline (Noisy)', 'QFL (Noisy)']):
+        cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+        sns.heatmap(
+            cm_norm, annot=True, fmt=".2f", cmap="Blues",
+            xticklabels=labels, yticklabels=labels, ax=ax, cbar=False
+        )
+        ax.set_title(title, fontweight='bold')
+        ax.set_xlabel("Vorhergesagt")
+        ax.set_ylabel("Tatsächlich")
+        for _, spine in ax.spines.items():
+            spine.set_visible(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, f"CM_Vergleich_{sub_id}.png"), dpi=300)
+    plt.close()
