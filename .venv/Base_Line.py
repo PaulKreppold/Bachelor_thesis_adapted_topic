@@ -11,7 +11,7 @@ class QuantumModel(nn.Module):
 
         dev = qml.device("default.qubit", wires=num_qubits)
 
-        # 👉 nur RY pro Qubit & Layer
+        # nur RY pro Qubit & Layer
         self.weight_shapes = {"weights": (num_layers, num_qubits)}
 
         @qml.qnode(dev, interface="torch", diff_method="backprop")

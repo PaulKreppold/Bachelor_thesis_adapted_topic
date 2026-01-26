@@ -110,13 +110,11 @@ def main():
     with open(summary_file_path, "w") as f:
         f.write(output_str)
 
-    # 5. Visualisierung
     print("Erstelle Plots...")
     plot_test_accuracy_distribution(f_test_acc, config.RESULTS_DIR)
     plot_averaged_results(all_histories, config.RESULTS_DIR)
 
     print(f"Alles erledigt. Ergebnisse gespeichert unter: {config.RESULTS_DIR}")
 
-# Der fehlende Aufruf:
 if __name__ == "__main__":
     main()
