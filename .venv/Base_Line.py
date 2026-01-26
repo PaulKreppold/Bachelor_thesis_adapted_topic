@@ -7,68 +7,89 @@ class QuantumModel(nn.Module):
         self,
         num_qubits,
         num_layers,
-        encoding="amplitude"  # "amplitude" | "angle_pca"
+        encoding="amplitude",        # "amplitude" | "angle_pca"
+        ansatz="strongly"             # "strongly" | "hardware_efficient"
     ):
         super().__init__()
 
         assert encoding in ["amplitude", "angle_pca"]
+        assert ansatz in ["strongly", "hardware_efficient"]
+
         self.encoding = encoding
+        self.ansatz = ansatz
         self.num_qubits = num_qubits
         self.num_layers = num_layers
 
         self.dev = qml.device("default.qubit", wires=num_qubits)
 
-        self.weight_shapes = {
-            "weights": (num_layers, num_qubits, 3)
-        }
+        # Einheitliche Weight-Form (wichtig für Vergleichbarkeit)
+        self.weight_shapes = {"weights": (num_layers, num_qubits, 3)}
 
-        @qml.qnode(self.dev, interface="torch", diff_method="backprop")
+        # -----------------------------
+        # QNode definieren
+        # -----------------------------
         def circuit(inputs, weights):
 
-            # ---------------------------
-            # 1. ENCODING
-            # ---------------------------
+            # -------- Encoding --------
             if self.encoding == "amplitude":
                 qml.AmplitudeEmbedding(
                     inputs,
                     wires=range(self.num_qubits),
                     normalize=True
                 )
+
             elif self.encoding == "angle_pca":
-                # inputs.shape = (2 * num_qubits,)
                 for q in range(self.num_qubits):
                     qml.RY(inputs[q], wires=q)
                     qml.RZ(inputs[q + self.num_qubits], wires=q)
 
-            # ---------------------------
-            # 2. VARIATIONAL ANSATZ
-            # ---------------------------
-            qml.StronglyEntanglingLayers(
-                weights,
-                wires=range(self.num_qubits)
-            )
+            # -------- Ansatz --------
+            if self.ansatz == "strongly":
+                qml.StronglyEntanglingLayers(
+                    weights, wires=range(self.num_qubits)
+                )
 
-            # ---------------------------
-            # 3. READOUT
-            # ---------------------------
+            elif self.ansatz == "hardware_efficient":
+                for l in range(self.num_layers):
+                    for q in range(self.num_qubits):
+                        qml.RY(weights[l, q, 0], wires=q)
+                        qml.RZ(weights[l, q, 1], wires=q)
+
+                    # lineare Entanglement-Topologie
+                    for q in range(self.num_qubits - 1):
+                        qml.CNOT(wires=[q, q + 1])
+
             return qml.expval(qml.PauliZ(0))
 
-        self.qlayer = qml.qnn.TorchLayer(circuit, self.weight_shapes)
+        # QNode
+        self.qnode = qml.QNode(circuit, self.dev, interface="torch")
 
-        # Xavier Initialization mit gain=0.1
-        nn.init.xavier_normal_(self.qlayer.weights['weights'].data, gain=0.1)
+        # TorchLayer
+        self.qlayer = qml.qnn.TorchLayer(self.qnode, self.weight_shapes)
+
+        # Initialisierung
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        with torch.no_grad():
+            nn.init.xavier_normal_(self.qlayer.weights, gain=0.1)
 
     def forward(self, x):
-        # Robust gegen verschiedene Input-Shapes
-        if x.ndim == 4:  # (B, C, H, W)
+        # x: (B, C, H, W) oder (B, features)
+        if x.ndim > 2:
             x = x.view(x.shape[0], -1)
-        elif x.ndim == 2:  # (B, features)
-            pass
-        elif x.ndim == 1:  # einzelnes Sample
-            x = x.unsqueeze(0)
 
-        q_out = self.qlayer(x)
+        outputs = []
+        for i in range(x.shape[0]):
+            outputs.append(self.qlayer(x[i]))
+
+        q_out = torch.stack(outputs)
+
+        # Map [-1, 1] → [0, 1]
         return ((q_out + 1) / 2).view(-1, 1)
+
+
+
 
 
 

@@ -1,73 +1,89 @@
 import matplotlib.pyplot as plt
 import numpy as np
-import os
+import pandas as pd
 import seaborn as sns
 
-def plot_averaged_results(all_histories, save_dir):
-    """Plottet Durchschnitt & Varianz über alle Seeds."""
-    epochs = len(all_histories[0]['loss'])
-    plt.figure(figsize=(12, 5))
 
-    metrics = [('loss', 'val_loss', 'MSE Loss', 1),
-               ('acc', 'val_acc', 'Accuracy', 2)]
+def setup_plot_style():
+    plt.style.use('seaborn-v0_8-paper')  # Oder 'default'
+    plt.rcParams.update({
+        'font.size': 10,
+        'axes.labelsize': 12,
+        'axes.titlesize': 12,
+        'legend.fontsize': 9,
+        'xtick.labelsize': 10,
+        'ytick.labelsize': 10,
+        'lines.linewidth': 1.5,
+        'axes.grid': True,
+        'grid.alpha': 0.3
+    })
 
-    for train_key, val_key, label, idx in metrics:
-        plt.subplot(1, 2, idx)
-        for key, col, name in [(train_key, 'blue', 'Train'), (val_key, 'orange', 'Val')]:
-            data = np.array([h[key] for h in all_histories])
-            mean = np.mean(data, axis=0)
-            std = np.std(data, axis=0)
 
-            plt.plot(range(1, epochs + 1), mean, label=f'{name} {label}', color=col)
-            plt.fill_between(range(1, epochs + 1), mean - std, mean + std, color=col, alpha=0.15)
+def plot_training_curves(histories, title, filename):
+    """
+    histories: Dict mit Key 'Label' und Value 'Liste von Arrays (einer pro Seed)'
+    """
+    setup_plot_style()
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
-        plt.title(f'Mean {label} (Seeds: {len(all_histories)})')
-        plt.xlabel('Epochs')
-        plt.ylabel(label)
-        plt.legend()
-        plt.grid(True, alpha=0.3)
+    colors = plt.cm.tab10(np.linspace(0, 1, len(histories)))
+
+    for i, (label, seeds_data) in enumerate(histories.items()):
+        # seeds_data ist (num_seeds, num_epochs)
+        acc_mean = np.mean([s['acc'] for s in seeds_data], axis=0)
+        acc_std = np.std([s['acc'] for s in seeds_data], axis=0)
+        loss_mean = np.mean([s['loss'] for s in seeds_data], axis=0)
+        loss_std = np.std([s['loss'] for s in seeds_data], axis=0)
+
+        epochs = np.arange(1, len(acc_mean) + 1)
+
+        # Accuracy Plot
+        ax1.plot(epochs, acc_mean, label=label, color=colors[i])
+        ax1.fill_between(epochs, acc_mean - acc_std, acc_mean + acc_std, alpha=0.1, color=colors[i])
+
+        # Loss Plot
+        ax2.plot(epochs, loss_mean, label=label, color=colors[i])
+        ax2.fill_between(epochs, loss_mean - loss_std, loss_mean + loss_std, alpha=0.1, color=colors[i])
+
+    ax1.set_title("Trainingsgenauigkeit")
+    ax1.set_xlabel("Epoche")
+    ax1.set_ylabel("Accuracy")
+    ax1.legend()
+
+    ax2.set_title("Trainingsverlust (BCE)")
+    ax2.set_xlabel("Epoche")
+    ax2.set_ylabel("Loss")
+    ax2.legend()
 
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, 'final_training_plot.png'))
+    plt.savefig(filename, dpi=300)
     plt.show()
 
 
-def plot_test_accuracy_distribution(test_accs, results_dir):
+def plot_academic_boxplot(data_dict, title, filename):
     """
-    Erstellt einen Boxplot der Test-Accuracy über alle Seeds im Stil von arXiv:2402.09902.
-    test_accs: Liste von Floats (0.0 bis 1.0)
+    data_dict: {'Modellname': [Werte_Seed1, Werte_Seed2, ...]}
     """
-    plt.figure(figsize=(6, 8))
+    setup_plot_style()
+    plt.figure(figsize=(8, 6))
 
-    # Daten in Prozent umrechnen
-    data = [acc * 100 for acc in test_accs]
+    # DataFrame für Seaborn
+    df = pd.DataFrame([(k, v) for k, l in data_dict.items() for v in l], columns=['Modell', 'Accuracy'])
 
-    # Style-Einstellungen
-    sns.set_theme(style="whitegrid", rc={"axes.grid.axis": "y"}) # Nur horizontaler Grid
+    # Boxplot ohne Füllung (patch_artist=False oder fill=False)
+    ax = sns.boxplot(x='Modell', y='Accuracy', data=df,
+                     color='black',
+                     fill=False,  # Erzeugt den "leeren" Look
+                     width=0.5,
+                     linewidth=1.2)
 
-    # Boxplot erstellen
-    sns.boxplot(
-        y=data,
-        width=0.5,
-        patch_artist=True, # Ermöglicht das Füllen der Box
-        boxprops=dict(facecolor='#a3c1ad', edgecolor='black', linewidth=1.5), # Füllfarbe, schwarzer Rand
-        whiskerprops=dict(color='black', linewidth=1.5), # Schwarze Whisker
-        capprops=dict(color='black', linewidth=1.5), # Schwarze Kappen
-        medianprops=dict(color='black', linewidth=2) # Schwarze, dickere Medianlinie
-    )
+    # Einzelne Datenpunkte (Seeds) einzeichnen
+    sns.stripplot(x='Modell', y='Accuracy', data=df, color='red', size=6, alpha=0.7)
 
-    # Einzelne Punkte (Seeds) darüber legen für maximale Transparenz
-    sns.stripplot(y=data, color="#2a4d34", size=6, jitter=True, edgecolor="black", linewidth=1)
-
-    plt.title("Verteilung der Test-Accuracy über alle Seeds", fontsize=14, pad=20)
-    plt.ylabel("Accuracy (%)", fontsize=12)
-    plt.ylim(0, 105)  # Immer 0-100% zeigen für bessere Relation
-
-    # Statistiken als Text einfügen
-    median_val = np.median(data)
-    plt.text(0.3, median_val, f'Median: {median_val:.2f}%',
-             weight='bold', va='center', backgroundcolor='white')
-
+    plt.title(title)
+    plt.ylabel("Finale Trainingsgenauigkeit")
+    plt.xticks(rotation=15)
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
     plt.tight_layout()
-    plt.savefig(os.path.join(results_dir, "test_accuracy_boxplot.png"), dpi=300)
-    plt.close()
+    plt.savefig(filename, dpi=300)
+    plt.show()

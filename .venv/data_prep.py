@@ -1,119 +1,89 @@
 import torch
+import numpy as np
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 import medmnist
 from medmnist import INFO
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import MinMaxScaler
-import numpy as np
 
-# ----------------------------
-# Dataset-Klasse für PCA/AngleEncoding
-# ----------------------------
+
 class PneumoniaDataset(Dataset):
     def __init__(self, x_tensor, y_tensor):
         self.dataset = x_tensor
         self.labels = y_tensor
 
-    def __len__(self):
-        return len(self.dataset)
+    def __len__(self): return len(self.dataset)
 
-    def __getitem__(self, idx):
-        return self.dataset[idx], self.labels[idx]
+    def __getitem__(self, idx): return self.dataset[idx], self.labels[idx]
 
 
-# ----------------------------
-# AmplitudeEmbedding Loader
-# ----------------------------
-def get_pneumonia_mnist_loaders(batch_size=32):
-    """
-    Lädt PneumoniaMNIST für AmplitudeEmbedding (16x16 = 256 Features)
-    """
-    data_flag = 'pneumoniamnist'
-    info = INFO[data_flag]
-    DataClass = getattr(medmnist, info['python_class'])
-
+def get_pneumonia_mnist_loaders(batch_size=32, num_qubits=8, seed=42):
+    """ Padding auf 2^num_qubits für Amplitude Embedding mit Seed-Handling """
+    dim = 2 ** num_qubits
+    side = int(np.sqrt(dim))
     transform = transforms.Compose([
-        transforms.Resize((16, 16)),  # 16x16 = 256 Features
+        transforms.Resize((side, side)),
         transforms.ToTensor(),
+        transforms.Lambda(lambda x: torch.flatten(x))
     ])
+    data_flag = 'pneumoniamnist'
+    DataClass = getattr(medmnist, INFO[data_flag]['python_class'])
 
-    train_dataset = DataClass(split='train', transform=transform, download=True)
-    val_dataset   = DataClass(split='val',   transform=transform, download=True)
-    test_dataset  = DataClass(split='test',  transform=transform, download=True)
+    train_ds = DataClass(split='train', transform=transform, download=True)
+    val_ds = DataClass(split='val', transform=transform, download=True)
+    test_ds = DataClass(split='test', transform=transform, download=True)
 
-    def loader(dataset):
-        return DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    # Generator für reproduzierbaren Shuffle im DataLoader
+    g = torch.Generator()
+    g.manual_seed(seed)
 
-    return loader(train_dataset), loader(val_dataset), loader(test_dataset)
+    def load(ds, shuffle=True):
+        return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
+                          drop_last=True, generator=g if shuffle else None)
+
+    return load(train_ds), load(val_ds, False), load(test_ds, False)
 
 
-# ----------------------------
-# PCA + Dense AngleEncoding Loader
-# ----------------------------
-def get_pca_angle_loaders(batch_size=32, n_components=20, seed=42):
-    """
-    Lädt PneumoniaMNIST, wendet PCA an und skaliert Komponenten auf [0, π].
-    """
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+def get_pca_angle_loaders(batch_size=32, num_qubits=10, encoding_type="angle_dense", seed=42):
+    """ PCA mit fixem Feature-Seed (42) und variablem DataLoader-Seed """
+    n_comp = 2 * num_qubits if encoding_type == "angle_dense" else num_qubits
 
     data_flag = 'pneumoniamnist'
-    info = INFO[data_flag]
-    DataClass = getattr(medmnist, info['python_class'])
+    DataClass = getattr(medmnist, INFO[data_flag]['python_class'])
+    transform = transforms.Compose([transforms.ToTensor(), transforms.Lambda(lambda x: torch.flatten(x))])
 
-    transform = transforms.Compose([
-        transforms.Resize((28, 28)),  # Standardgröße für PCA
-        transforms.ToTensor(),
-    ])
+    datasets = {s: DataClass(split=s, transform=transform, download=True) for s in ['train', 'val', 'test']}
 
-    # Bilder laden
-    train_dataset = DataClass(split='train', transform=transform, download=True)
-    val_dataset   = DataClass(split='val',   transform=transform, download=True)
-    test_dataset  = DataClass(split='test',  transform=transform, download=True)
+    def get_xy(ds):
+        x = np.stack([item[0].numpy() for item in ds])
+        y = np.array([item[1] for item in ds])
+        return x, y
 
-    # Hilfsfunktion: Dataset → flacher Tensor
-    def dataset_to_tensor(dataset):
-        imgs = []
-        labels = []
-        for img, label in dataset:
-            imgs.append(img.view(-1).numpy())  # flatten
-            labels.append(label)
-        return np.stack(imgs), np.array(labels)
+    x_train, y_train = get_xy(datasets['train'])
+    x_val, y_val = get_xy(datasets['val'])
+    x_test, y_test = get_xy(datasets['test'])
 
-    x_train, y_train = dataset_to_tensor(train_dataset)
-    x_val,   y_val   = dataset_to_tensor(val_dataset)
-    x_test,  y_test  = dataset_to_tensor(test_dataset)
+    # PCA Seed fixieren (42), damit Features über Modell-Seeds hinweg identisch sind
+    pca = PCA(n_components=n_comp, random_state=42)
+    x_train = pca.fit_transform(x_train)
+    x_val = pca.transform(x_val)
+    x_test = pca.transform(x_test)
 
-    # PCA
-    pca = PCA(n_components=n_components)
-    x_train_pca = pca.fit_transform(x_train)
-    x_val_pca   = pca.transform(x_val)
-    x_test_pca  = pca.transform(x_test)
-
-    # Scaling auf [0, π] für Dense Angle Encoding
     scaler = MinMaxScaler(feature_range=(0, np.pi))
-    x_train_scaled = scaler.fit_transform(x_train_pca)
-    x_val_scaled   = scaler.transform(x_val_pca)
-    x_test_scaled  = scaler.transform(x_test_pca)
+    x_train = scaler.fit_transform(x_train)
+    x_val = scaler.transform(x_val)
+    x_test = scaler.transform(x_test)
 
-    # PyTorch Datasets & Loader
-    train_loader = DataLoader(
-        PneumoniaDataset(torch.tensor(x_train_scaled, dtype=torch.float32),
-                         torch.tensor(y_train, dtype=torch.float32).view(-1, 1)),
-        batch_size=batch_size, shuffle=True, drop_last=True
-    )
-    val_loader = DataLoader(
-        PneumoniaDataset(torch.tensor(x_val_scaled, dtype=torch.float32),
-                         torch.tensor(y_val, dtype=torch.float32).view(-1, 1)),
-        batch_size=batch_size, shuffle=False
-    )
-    test_loader = DataLoader(
-        PneumoniaDataset(torch.tensor(x_test_scaled, dtype=torch.float32),
-                         torch.tensor(y_test, dtype=torch.float32).view(-1, 1)),
-        batch_size=batch_size, shuffle=False
-    )
+    # Generator für Shuffle
+    g = torch.Generator()
+    g.manual_seed(seed)
 
-    return train_loader, val_loader, test_loader
+    def create(x, y, shuffle=False):
+        ds = PneumoniaDataset(torch.tensor(x, dtype=torch.float32),
+                              torch.tensor(y, dtype=torch.float32).view(-1, 1))
+        return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
+                          drop_last=True, generator=g if shuffle else None)
 
+    return create(x_train, y_train, True), create(x_val, y_val), create(x_test, y_test)
 

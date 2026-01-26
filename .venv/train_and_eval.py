@@ -1,84 +1,114 @@
 import torch
+import json
+import os
 import numpy as np
 from sklearn.metrics import confusion_matrix
+from tqdm import tqdm
+import time
 
 
-def train_model(model, train_loader, val_loader, optimizer, criterion, epochs, seed, device):
+def train_model(model, train_loader, val_loader, optimizer, criterion, epochs, device):
     """
-    Trainiert das VQC-Modell unter Verwendung von BCELoss (für Wahrscheinlichkeits-Outputs).
+    Trainiert das Modell und behebt den Dtype-Fehler (Labels zu Float).
     """
     history = {'loss': [], 'acc': [], 'val_loss': [], 'val_acc': []}
-    final_cm = None
 
-    for epoch in range(epochs):
+    # Progress Bar Initialisierung
+    pbar = tqdm(range(epochs), desc="Initialisierung", unit="epoch", leave=False)
+
+    for epoch in pbar:
         model.train()
-        running_loss, correct, total = 0.0, 0, 0
+        running_loss = 0.0
+        correct = 0
+        total = 0
 
-        for inputs, targets in train_loader:
-            inputs, targets = inputs.to(device), targets.to(device).float().view(-1, 1)
+        for inputs, labels in train_loader:
+            # FIX: Labels zu float konvertieren für BCELoss
+            inputs, labels = inputs.to(device), labels.to(device).float()
 
             optimizer.zero_grad()
-
-            # Forward Pass: Liefert Wahrscheinlichkeiten [0, 1]
             outputs = model(inputs)
 
-            # WICHTIG: Nutze nn.BCELoss() im Hauptskript als 'criterion'
-            loss = criterion(outputs, targets)
+            # Form-Check (Sicherheitsmaßnahme gegen Broadcasting-Fehler)
+            loss = criterion(outputs, labels.view_as(outputs))
 
             loss.backward()
             optimizer.step()
 
-            # Klassifizierung: Da Output [0, 1], ist der Schwellenwert 0.5
-            preds = (outputs >= 0.5).float()
-
-            correct += (preds == targets).sum().item()
-            total += targets.size(0)
             running_loss += loss.item() * inputs.size(0)
+            preds = (outputs > 0.5).float()
+            correct += (preds == labels.view_as(outputs)).sum().item()
+            total += labels.size(0)
 
-        # Validierung
-        val_loss, val_acc, cm = evaluate_model(model, val_loader, criterion, device)
+        epoch_loss = running_loss / total
+        epoch_acc = correct / total
 
-        if epoch == epochs - 1:
-            final_cm = cm
+        # Validierung am Epochenende
+        val_loss, val_acc, _ = evaluate_model(model, val_loader, criterion, device)
 
-        train_loss = running_loss / total
-        train_acc = correct / total
-        history['loss'].append(train_loss)
-        history['acc'].append(train_acc)
-        history['val_loss'].append(val_loss)
-        history['val_acc'].append(val_acc)
+        history['loss'].append(float(epoch_loss))
+        history['acc'].append(float(epoch_acc))
+        history['val_loss'].append(float(val_loss))
+        history['val_acc'].append(float(val_acc))
 
-        print(f"Seed {seed:4} | Ep [{epoch + 1:02d}/{epochs}] "
-              f"L: {train_loss:.4f} | A: {train_acc:.4f} | "
-              f"Val-L: {val_loss:.4f} | Val-A: {val_acc:.4f}")
+        # Nutzung der epoch-Variable für die Anzeige
+        pbar.set_description(f"Epoch {epoch + 1}/{epochs}")
+        pbar.set_postfix({
+            'Loss': f"{epoch_loss:.3f}",
+            'Acc': f"{epoch_acc:.3f}",
+            'ValAcc': f"{val_acc:.3f}"
+        })
 
-    return history, final_cm
+    return history
 
 
-def evaluate_model(model, data_loader, criterion, device):
+def evaluate_model(model, loader, criterion, device):
+    """
+    Evaluiert das Modell und liefert Metriken.
+    """
     model.eval()
-    running_loss, correct, total = 0.0, 0, 0
+    running_loss = 0.0
     all_preds = []
-    all_targets = []
+    all_labels = []
 
     with torch.no_grad():
-        for inputs, targets in data_loader:
-            inputs, targets = inputs.to(device), targets.to(device).float().view(-1, 1)
-
+        for inputs, labels in loader:
+            inputs, labels = inputs.to(device), labels.to(device).float()
             outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            running_loss += loss.item() * inputs.size(0)
+            loss = criterion(outputs, labels.view_as(outputs))
 
-            # Schwellenwert 0.5 für Wahrscheinlichkeiten
-            preds = (outputs >= 0.5).float()
+            running_loss += loss.item() * inputs.size(0)
+            preds = (outputs > 0.5).float()
 
             all_preds.extend(preds.cpu().numpy())
-            all_targets.extend(targets.cpu().numpy())
-            correct += (preds == targets).sum().item()
-            total += targets.size(0)
+            all_labels.extend(labels.cpu().numpy())
 
-    avg_loss = running_loss / total
-    avg_acc = correct / total
-    cm = confusion_matrix(all_targets, all_preds, labels=[0, 1])
+    avg_loss = running_loss / len(loader.dataset)
+    acc = np.mean(np.array(all_preds).flatten() == np.array(all_labels).flatten())
+    cm = confusion_matrix(all_labels, all_preds, labels=[0, 1])
 
-    return avg_loss, avg_acc, cm
+    return avg_loss, acc, cm
+
+
+def save_experiment_results(stats_dir, models_dir, file_name, history, test_metrics, model, duration=None):
+    """
+    Speichert Metriken als JSON und Modellgewichte als .pth.
+    """
+    results = {
+        "history": history,
+        "test_metrics": {
+            "loss": float(test_metrics['loss']),
+            "acc": float(test_metrics['acc']),
+            "cm": test_metrics['cm'].tolist()
+        }
+    }
+
+    if duration:
+        results["duration_seconds"] = duration
+
+    # JSON Speichern (Statistiken)
+    with open(os.path.join(stats_dir, f"{file_name}.json"), 'w') as f:
+        json.dump(results, f, indent=4)
+
+    # Modell Speichern (Gewichte)
+    torch.save(model.state_dict(), os.path.join(models_dir, f"{file_name}.pth"))
