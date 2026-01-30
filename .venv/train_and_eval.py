@@ -12,22 +12,17 @@ from sklearn.metrics import (
 
 def evaluate_model(model, data_loader, device, minority_idx=None):
     """
-    Führt eine umfassende Evaluierung durch und speichert das
-    Ergebnis in einer Variable, bevor es zurückgegeben wird.
+    Führt eine umfassende Evaluierung des Modells durch.
+    Inkludiert Metriken für die Minderheitsklasse und Macro-Durchschnitte.
     """
     model.eval()
     criterion = torch.nn.BCELoss()
-    running_loss = 0.0
-    total = 0
-    all_probs = []
-    all_preds = []
-    all_targets = []
+    running_loss, total = 0.0, 0
+    all_probs, all_preds, all_targets = [], [], []
 
     with torch.no_grad():
         for inputs, targets in data_loader:
-            inputs = inputs.to(device)
-            targets = targets.to(device).float().view(-1, 1)
-
+            inputs, targets = inputs.to(device), targets.to(device).float().view(-1, 1)
             outputs = model(inputs)
             loss = criterion(outputs, targets)
 
@@ -39,55 +34,62 @@ def evaluate_model(model, data_loader, device, minority_idx=None):
             all_preds.extend((probs >= 0.5).astype(int))
             all_targets.extend(targets.cpu().numpy().flatten())
 
+    # WICHTIG: Fix für TypeError (Umwandlung in NumPy-Arrays für mathematische Operationen)
     all_targets = np.array(all_targets)
     all_preds = np.array(all_preds)
     all_probs = np.array(all_probs)
 
-    # Bestimmung der Minderheitsklasse
+    # Ermittlung des minority_idx falls nicht gesetzt
     if minority_idx is None:
         counts = np.bincount(all_targets.astype(int), minlength=2)
         minority_idx = np.argmin(counts) if counts[0] != counts[1] else 1
 
-    # Metriken berechnen
+    # Per-Class Metriken (Precision, Recall, F1)
     prec, rec, f1, _ = precision_recall_fscore_support(
-        all_targets,
-        all_preds,
-        labels=[0, 1],
-        average=None,
-        zero_division=0
+        all_targets, all_preds, labels=[0, 1], average=None, zero_division=0
     )
 
-    # AUC Metriken
-    if len(np.unique(all_targets)) > 1:
-        if minority_idx == 1:
-            pr_auc_min = average_precision_score(all_targets, all_probs)
-        else:
-            pr_auc_min = average_precision_score(1 - all_targets, 1 - all_probs)
-        roc_auc = roc_auc_score(all_targets, all_probs)
-    else:
-        pr_auc_min = 0.0
-        roc_auc = 0.5
+    # Macro-Metriken (Ungewichteter Durchschnitt über beide Klassen)
+    prec_macro, rec_macro, f1_macro, _ = precision_recall_fscore_support(
+        all_targets, all_preds, average='macro', zero_division=0
+    )
 
-    # Speicherung im Dictionary-Objekt (Variable)
+    # PR-AUC Berechnung (Fokus auf die Minderheitsklasse für LDS-Studie [cite: 17, 18])
+    if minority_idx == 1:
+        pr_auc_min = average_precision_score(all_targets, all_probs)
+    else:
+        # Flippen der Labels/Probs, falls Klasse 0 die Minderheit ist
+        pr_auc_min = average_precision_score(1 - all_targets, 1 - all_probs)
+
+    # ROC-AUC (Globale Trennschärfe )
+    roc_auc = roc_auc_score(all_targets, all_probs) if len(np.unique(all_targets)) > 1 else 0.5
+
     evaluation_results = {
         'Testverlust': running_loss / total,
         'Testgenauigkeit': accuracy_score(all_targets, all_preds),
         'Balancierte_Genauigkeit': balanced_accuracy_score(all_targets, all_preds),
+
+        # Minderheits-Metriken (Zentral für Non-IID / LDS Analyse [cite: 17, 24])
         'F1_Minderheit': f1[minority_idx],
         'Recall_Minderheit': rec[minority_idx],
-        'PR_AUC': pr_auc_min,
-        'ROC_AUC': roc_auc,
-        'cm': confusion_matrix(all_targets, all_preds, labels=[0, 1]),
+        'Precision_Minderheit': prec[minority_idx],
+        'PR_AUC_Minority': pr_auc_min,
+
+        # Macro-Metriken (Robustheit & Fairness-Indikatoren )
+        'F1_Macro': f1_macro,
+        'Recall_Macro': rec_macro,
+        'Precision_Macro': prec_macro,
+
+        'ROC_AUC_Global': roc_auc,
+        'cm': confusion_matrix(all_targets, all_preds, labels=[0, 1]).tolist(),
         'minority_idx': int(minority_idx)
     }
-
     return evaluation_results
 
 
 def train_local_model(model, train_loader, val_loader, optimizer, epochs, device, client_id=""):
     """
-    Schnelles Training für Kurven-Daten (Paper-Look).
-    Berechnet nur Loss/Acc pro Epoche.
+    Trainiert ein lokales Modell und protokolliert den Fortschritt[cite: 21, 27].
     """
     model.train()
     criterion = torch.nn.BCELoss()
@@ -99,6 +101,7 @@ def train_local_model(model, train_loader, val_loader, optimizer, epochs, device
 
         for inputs, targets in train_loader:
             inputs, targets = inputs.to(device), targets.to(device).float().view(-1, 1)
+
             optimizer.zero_grad()
             outputs = model(inputs)
             loss = criterion(outputs, targets)
@@ -110,16 +113,15 @@ def train_local_model(model, train_loader, val_loader, optimizer, epochs, device
             total += targets.size(0)
             running_loss += loss.item() * inputs.size(0)
 
-        # 1. Training-Metriken (direkt berechnet)
+        # Training-Stats speichern
         history['train_loss'].append(running_loss / total)
         history['train_acc'].append(correct / total)
 
-        # 2. Leichtgewichtige Validierung (ohne evaluate_model aufzurufen)
-        # Das spart RAM, da keine Listen für AUC angesammelt werden
+        # Validierung pro Epoche (für Konvergenzkurven )
         model.eval()
         v_loss, v_corr, v_total = 0.0, 0, 0
         with torch.no_grad():
-            for vi, vt in val_loader:  # vi = Val-Inputs, vt = Val-Targets
+            for vi, vt in val_loader:
                 vi, vt = vi.to(device), vt.to(device).float().view(-1, 1)
                 vo = model(vi)
                 v_loss += criterion(vo, vt).item() * vi.size(0)
@@ -129,7 +131,8 @@ def train_local_model(model, train_loader, val_loader, optimizer, epochs, device
         history['val_loss'].append(v_loss / v_total)
         history['val_acc'].append(v_corr / v_total)
 
-        if (epoch + 1) % 5 == 0 or epoch == epochs - 1:
+        # Protokollierung (Wichtig für die Überwachung langer Läufe [cite: 22])
+        if (epoch + 1) % 1 == 0 or epoch == epochs - 1:
             print(f"[{client_id}] Ep {epoch + 1}/{epochs} | "
                   f"train acc: {history['train_acc'][-1]:.3f}, val acc: {history['val_acc'][-1]:.3f} | "
                   f"train loss: {history['train_loss'][-1]:.3f}, val loss: {history['val_loss'][-1]:.3f}")

@@ -11,6 +11,7 @@ from sklearn.decomposition import PCA
 from sklearn.preprocessing import MinMaxScaler
 import config
 
+
 # ==================================================
 # 1. PYTORCH DATASET KLASSE
 # ==================================================
@@ -26,6 +27,7 @@ class PneumoniaDataset(Dataset):
     def __getitem__(self, idx):
         return self.dataset[idx], self.labels[idx]
 
+
 # ==================================================
 # 2. FEDERATED DATA ORCHESTRATOR
 # ==================================================
@@ -34,7 +36,7 @@ class FederatedDataOrchestrator:
     def __init__(self, n_components=20, batch_size=16, seed=42):
         self.n_components = n_components
         self.batch_size = batch_size
-        self.seed = seed # Dynamischer Seed für Varianz pro Experiment-Run
+        self.seed = seed
         self.transform = transforms.Compose([
             transforms.Resize((28, 28)),
             transforms.Grayscale(1),
@@ -42,6 +44,7 @@ class FederatedDataOrchestrator:
         ])
         self.raw_pools = {}
         self.metadata = {}
+        self.pca_pool = []  # Speichert PCA-Kalibrierungsdaten
 
     def _get_disjoint_sample(self, df, target_n, pos_ratio):
         """Zieht Stichproben basierend auf dem Instanz-Seed."""
@@ -51,7 +54,6 @@ class FederatedDataOrchestrator:
         pos_pool = df[df['label'] == 1]
         neg_pool = df[df['label'] == 0]
 
-        # Nutzt den übergebenen Seed für echtes Resampling pro Seed-Durchlauf
         sampled_pos = pos_pool.sample(n=min(n_pos, len(pos_pool)), random_state=self.seed)
         sampled_neg = neg_pool.sample(n=min(n_neg, len(neg_pool)), random_state=self.seed)
 
@@ -68,10 +70,10 @@ class FederatedDataOrchestrator:
                 lbls.append(row['label'])
         return np.array(imgs, dtype=np.float32), np.array(lbls, dtype=np.float32)
 
-    # --- DATENSATZ-LOGIK MIT OPTIMIERTEM SHARING ---
+    # --- DATENSATZ-LOGIK MIT PCA-POOL EXTRAKTION ---
 
     def _prepare_mnist(self):
-        """Client 1: PneumoniaMNIST (Test/Val außerhalb der Schleife fixiert)."""
+        """Client 1: PneumoniaMNIST mit PCA-Pool-Extraktion."""
         info = INFO['pneumoniamnist']
         DataClass = getattr(medmnist, info['python_class'])
         data_list = []
@@ -83,79 +85,112 @@ class FederatedDataOrchestrator:
 
         full_df = pd.concat(data_list).drop_duplicates().reset_index(drop=True)
 
-        # Gemeinsame Test/Val-Sets für alle MNIST-Subclients
-        test_df, rem = self._get_disjoint_sample(full_df, 624, 0.50)
+        # 1. ZUERST: PCA-Pool ziehen (250 Samples)
+        pca_df, rem = self._get_disjoint_sample(full_df, 250, 0.50)
+        self.pca_pool.append(pca_df.drop(columns='label').values)
+
+        # 2. DANN: Test/Val/Train aus den verbleibenden Daten
+        test_df, rem = self._get_disjoint_sample(rem, 624, 0.50)
         val_df, rem = self._get_disjoint_sample(rem, 524, 0.75)
 
         tx, ty = test_df.drop(columns='label').values, test_df['label'].values
         vx, vy = val_df.drop(columns='label').values, val_df['label'].values
 
+        # 3. Subclients aus verbleibendem Pool erstellen
         for i in range(1, 5):
             ratio = 0.90 if i == 1 else 0.75
             train_df, rem = self._get_disjoint_sample(rem, 1000, ratio)
             sid = f"client_1_sub_{i}"
             self.raw_pools[sid] = {
-                'train_x': train_df.drop(columns='label').values, 'train_y': train_df['label'].values,
-                'val_x': vx, 'val_y': vy, 'test_x': tx, 'test_y': ty
+                'train_x': train_df.drop(columns='label').values,
+                'train_y': train_df['label'].values,
+                'val_x': vx, 'val_y': vy,
+                'test_x': tx, 'test_y': ty
             }
 
     def _prepare_rsna(self, root):
-        """Client 2 & 3: RSNA (Behebt Punkt 1 & 2 aus dem Anhang)."""
+        """Client 2 & 3: RSNA mit PCA-Pool-Extraktion."""
         df = pd.read_csv(os.path.join(root, 'stage2_train_metadata.csv'))
         df = df[df['class'].isin(['Normal', 'Lung Opacity'])].drop_duplicates(subset='patientId')
         df['label'] = df['class'].map({'Normal': 0, 'Lung Opacity': 1})
         df['full_path'] = df['patientId'].apply(lambda x: os.path.join(root, 'Training/Images', f"{x}.png"))
 
+        # Initialer Split in C2/C3 Pools
         c2_pool = df.sample(frac=0.5, random_state=self.seed)
         c3_pool = df.drop(c2_pool.index)
 
         for base_id, pool, ratio in [('client_2', c2_pool, 0.60), ('client_3', c3_pool, 0.40)]:
-            # 1. Gemeinsame Test/Val Sets für die Subclients dieses Base-Clients ziehen
-            test_df, rem = self._get_disjoint_sample(pool, 624, 0.50)
+            # 1. ZUERST: PCA-Pool ziehen (125 Samples pro Base-Client)
+            pca_df, rem = self._get_disjoint_sample(pool, 125, 0.50)
+            pca_x, _ = self._load_images_from_disk(pca_df)
+            self.pca_pool.append(pca_x)
+
+            # 2. DANN: Test/Val aus verbleibenden Daten
+            test_df, rem = self._get_disjoint_sample(rem, 624, 0.50)
             val_df, rem = self._get_disjoint_sample(rem, 524, ratio)
 
-            # 2. Bilder EINMAL laden (behebt 🐌-Problem)
             vx, vy = self._load_images_from_disk(val_df)
             tx, ty = self._load_images_from_disk(test_df)
 
+            # 3. Subclients erstellen
             for i in range(1, 5):
                 train_df, rem = self._get_disjoint_sample(rem, 1000, ratio)
                 x, y = self._load_images_from_disk(train_df)
                 self.raw_pools[f"{base_id}_sub_{i}"] = {
-                    'train_x': x, 'train_y': y, 'val_x': vx, 'val_y': vy, 'test_x': tx, 'test_y': ty
+                    'train_x': x, 'train_y': y,
+                    'val_x': vx, 'val_y': vy,
+                    'test_x': tx, 'test_y': ty
                 }
 
     def _prepare_chexpert(self, root):
-        """Client 4: CheXpert (Optimiertes Sharing)."""
+        """Client 4: CheXpert mit PCA-Pool-Extraktion."""
         df = pd.read_csv(os.path.join(root, 'train.csv'))
         df = df[(df['Pneumonia'] == 1.0) | (df['No Finding'] == 1.0)]
         df['label'] = (df['Pneumonia'] == 1.0).astype(int)
         df['full_path'] = df['Path'].apply(lambda x: os.path.join(root, x))
 
-        test_df, rem = self._get_disjoint_sample(df, 624, 0.50)
+        # 1. ZUERST: PCA-Pool (250 Samples)
+        pca_df, rem = self._get_disjoint_sample(df, 250, 0.50)
+        pca_x, _ = self._load_images_from_disk(pca_df)
+        self.pca_pool.append(pca_x)
+
+        # 2. DANN: Test/Val aus verbleibenden Daten
+        test_df, rem = self._get_disjoint_sample(rem, 624, 0.50)
         val_df, rem = self._get_disjoint_sample(rem, 524, 0.25)
 
         vx, vy = self._load_images_from_disk(val_df)
         tx, ty = self._load_images_from_disk(test_df)
 
+        # 3. Subclients erstellen
         for i in range(1, 5):
             ratio = 0.10 if i == 1 else 0.25
             train_df, rem = self._get_disjoint_sample(rem, 1000, ratio)
             x, y = self._load_images_from_disk(train_df)
             self.raw_pools[f"client_4_sub_{i}"] = {
-                'train_x': x, 'train_y': y, 'val_x': vx, 'val_y': vy, 'test_x': tx, 'test_y': ty
+                'train_x': x, 'train_y': y,
+                'val_x': vx, 'val_y': vy,
+                'test_x': tx, 'test_y': ty
             }
 
     def build(self, rsna_root, chexpert_root):
-        """Führt PCA & Scaling basierend auf dem aktuellen Seed-Pool aus."""
+        """Führt PCA & Scaling auf separatem Kalibrierungs-Pool aus."""
+        # 1. Datasets vorbereiten (PCA-Pool wird automatisch befüllt)
         self._prepare_mnist()
         self._prepare_rsna(rsna_root)
         self._prepare_chexpert(chexpert_root)
 
-        all_train_x = np.vstack([v['train_x'] for v in self.raw_pools.values()])
-        pca = PCA(n_components=self.n_components).fit(all_train_x)
-        scaler = MinMaxScaler(feature_range=(0, np.pi)).fit(pca.transform(all_train_x))
+        # 2. PCA auf dem separaten Pool fitten
+        pca_calibration_data = np.vstack(self.pca_pool)
+        print(f"\n🔧 PCA-Kalibrierung auf {len(pca_calibration_data)} disjunkten Samples")
+        print(f"   └─ Client 1 (MNIST):   250 Samples")
+        print(f"   └─ Client 2 (RSNA):    125 Samples")
+        print(f"   └─ Client 3 (RSNA):    125 Samples")
+        print(f"   └─ Client 4 (CheXpert): 250 Samples")
 
+        pca = PCA(n_components=self.n_components).fit(pca_calibration_data)
+        scaler = MinMaxScaler(feature_range=(0, np.pi)).fit(pca.transform(pca_calibration_data))
+
+        # 3. DataLoader erstellen
         final_loaders = {}
         for sid, d in self.raw_pools.items():
             def to_loader(x, y, shuffle=False):
@@ -173,9 +208,13 @@ class FederatedDataOrchestrator:
             }
             y_train = d['train_y'].astype(int)
             counts = np.bincount(y_train, minlength=2)
-            self.metadata[sid] = {'lds_ratio': np.max(counts) / len(y_train), 'minority_idx': np.argmin(counts)}
+            self.metadata[sid] = {
+                'lds_ratio': np.max(counts) / len(y_train),
+                'minority_idx': np.argmin(counts)
+            }
 
         return final_loaders, self.metadata
+
 
 # ==================================================
 # 3. EXTERNE SCHNITTSTELLEN
@@ -190,12 +229,12 @@ def get_federated_pca_loaders(rsna_root, chexpert_root, current_seed=42):
     )
     return orchestrator.build(rsna_root, chexpert_root)
 
+
 def get_centralized_loader(all_fed_loaders, batch_size):
     """Bündelt alle Trainingsdaten der Subclients für die zentrale Baseline."""
     all_x = []
     all_y = []
     for sid in all_fed_loaders:
-        # Zugriff auf die Tensors im PneumoniaDataset
         ds = all_fed_loaders[sid]['train'].dataset
         all_x.append(ds.dataset)
         all_y.append(ds.labels)
@@ -242,4 +281,4 @@ def verify_disjoint_subclients(final_loaders):
             else:
                 seen_hashes[h] = sid
     if not overlap:
-        print(f"ERGEBNIS: Alle {len(final_loaders)} Subclients sind zu 100% disjunkt.")
+        print(f"✅ ERGEBNIS: Alle {len(final_loaders)} Subclients sind zu 100% disjunkt.")

@@ -4,6 +4,8 @@ import numpy as np
 import pandas as pd
 from concurrent.futures import ProcessPoolExecutor
 import functools
+import json
+import pickle
 
 # Eigene Module
 import config
@@ -13,281 +15,259 @@ import aggregation
 from Base_Line import QuantumModel
 from train_and_eval import train_local_model, evaluate_model
 
+# Mapping für bessere Lesbarkeit in CSV/Plots
+STRAT_MAPPING = {
+    "central": "Zentrale Baseline",
+    "local": "Lokale Baseline",
+    "qfl_global": "QFL Global",
+    "qfl_local": "QFL Local (Personalisiert)"
+}
 
-def run_single_seed(seed, label, actual_type, n_p, rsna_root, chexpert_root):
-    """
-    Führt einen kompletten Durchlauf für einen Seed aus.
-    Lädt Daten pro Seed neu für maximale Varianz.
-    """
-    print(f"\n>>> START SEED {seed} | Konfiguration: {label}")
 
-    # Daten neu laden pro Seed (wissenschaftliche Varianz)
-    loaders, meta = data_prep.get_federated_pca_loaders(
-        rsna_root,
-        chexpert_root,
-        current_seed=seed
-    )
-    g_val_loader = aggregation.build_global_val_loader(loaders)
-    cent_loader = data_prep.get_centralized_loader(loaders, config.BATCH_SIZE)
+# =============================================================================
+# HILFSFUNKTIONEN
+# =============================================================================
 
+def convert_for_json(data):
+    """Konvertiert NumPy-Typen rekursiv in JSON-kompatible Python-Typen."""
+    if isinstance(data, np.ndarray):
+        return data.tolist()
+    elif isinstance(data, dict):
+        return {k: convert_for_json(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [convert_for_json(item) for item in data]
+    elif isinstance(data, (np.integer, np.floating)):
+        return float(data)
+    else:
+        return data
+
+
+# =============================================================================
+# CORE EXPERIMENT LOGIC (SINGLE SEED)
+# =============================================================================
+
+def run_single_seed(seed, label, actual_type, n_p, rsna_root, chexpert_root, is_first_run=False):
+    print(f"\n>>> [SEED {seed}] Starte Szenario: {label}")
+
+    # Reproduzierbarkeit
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    seed_results = []
-    # Speicher für jede Epoche des Trainingsverlaufs
-    qfl_loc_accum = {
-        s: {'train_acc': [], 'train_loss': []} for s in config.ALL_SUBCLIENTS
-    }
-    seed_histories = {
-        'Local Baseline': {s: [] for s in config.ALL_SUBCLIENTS},
-        'lds_cms': {}
-    }
-
-    # --- A. ZENTRALE BASELINE ---
-    c_model = QuantumModel(config.NUM_LAYERS, actual_type, n_p).to(config.DEVICE)
-    train_local_model(
-        c_model,
-        cent_loader,
-        g_val_loader,
-        torch.optim.Adam(c_model.parameters(), lr=config.LR),
-        config.EPOCHS_BASELINE,
-        config.DEVICE,
-        client_id=f"S{seed}_Cent"
+    # Daten laden
+    loaders, meta = data_prep.get_federated_pca_loaders(
+        rsna_root, chexpert_root, current_seed=seed
     )
 
+    if is_first_run:
+        data_prep.print_dataset_stats(loaders)
+        data_prep.verify_disjoint_subclients(loaders)
+
+    g_val_loader = aggregation.build_global_val_loader(loaders)
+    cent_loader = data_prep.get_centralized_loader(loaders, config.BATCH_SIZE)
+
+    model_dir = os.path.join(config.BASE_RESULTS_DIR, label, "models")
+    os.makedirs(model_dir, exist_ok=True)
+
+    # Speicherstruktur initialisieren
+    seed_data = {
+        "metadata": {"seed": seed, "scenario": label, "noise_type": str(actual_type), "noise_p": n_p},
+        "training": {
+            "central": None,
+            "local": {},
+            "qfl_local_history": {},
+            "qfl_global_rounds": []
+        },
+        "evaluation": {"central": {}, "local": {}, "qfl_local": {}, "qfl_global": {}},
+        "confusion_matrices": {}
+    }
+
+    # ---------------------------------------------------------
+    # 1. ZENTRALE BASELINE
+    # ---------------------------------------------------------
+    print(f"[{seed}] Training Zentrale Baseline...")
+    central_model = QuantumModel(config.NUM_LAYERS, actual_type, n_p).to(config.DEVICE)
+    _, central_hist = train_local_model(
+        central_model, cent_loader, g_val_loader,
+        torch.optim.Adam(central_model.parameters(), lr=config.LR),
+        config.EPOCHS_BASELINE, config.DEVICE, client_id=f"S{seed}_Central"
+    )
+    seed_data["training"]["central"] = central_hist
+    torch.save(central_model.state_dict(), os.path.join(model_dir, f"S{seed}_Central.pth"))
+
+    # Effiziente Eval: Einmal pro Base-Client
+    for base_client in config.BASE_CLIENTS:
+        rep_sub = f"{base_client}_sub_1"
+        m_rep = evaluate_model(central_model, loaders[rep_sub]['test'], config.DEVICE, meta[rep_sub]['minority_idx'])
+        seed_data["confusion_matrices"][(base_client, 'Zentrale')] = m_rep['cm']
+
+        for i in range(1, config.NUM_SUBCLIENTS_PER_BASE + 1):
+            sid = f"{base_client}_sub_{i}"
+            seed_data["evaluation"]["central"][sid] = {
+                **{k: v for k, v in m_rep.items() if k != 'cm'},
+                "lds_ratio": meta[sid]["lds_ratio"]
+            }
+
+    # ---------------------------------------------------------
+    # 2. LOKALE BASELINES
+    # ---------------------------------------------------------
+    print(f"[{seed}] Training Lokale Baselines...")
     for sid in config.ALL_SUBCLIENTS:
-        # Evaluierung mit Dictionary-Rückgabe
-        m = evaluate_model(
-            c_model,
-            loaders[sid]['test'],
-            config.DEVICE,
-            meta[sid]['minority_idx']
+        local_model = QuantumModel(config.NUM_LAYERS, actual_type, n_p).to(config.DEVICE)
+        _, h = train_local_model(
+            local_model, loaders[sid]['train'], loaders[sid]['val'],
+            torch.optim.Adam(local_model.parameters(), lr=config.LR),
+            config.EPOCHS_BASELINE, config.DEVICE, client_id=f"S{seed}_{sid}_Local"
         )
-        seed_results.append({
-            'Seed': seed,
-            'Szenario': 'Zentrale Baseline',
-            'Noise_Type': actual_type or "None",
-            'Noise_P': n_p,
-            'Client': sid.split('_sub')[0],
-            'Subclient': sid.split('_sub_')[1],
-            'Testgenauigkeit': m['Testgenauigkeit'],
-            'Testverlust': m['Testverlust'],
-            'ROC_AUC': m['ROC_AUC'],
-            'PR_AUC': m['PR_AUC'],
-            'Recall_Minderheit': m['Recall_Minderheit'],
-            'F1_Minderheit': m['F1_Minderheit'],
-            'Balancierte_Genauigkeit': m['Balancierte_Genauigkeit']
-        })
+        seed_data["training"]["local"][sid] = h
+        torch.save(local_model.state_dict(), os.path.join(model_dir, f"S{seed}_{sid}_Local.pth"))
 
-    # --- B. LOKALE BASELINE ---
+        m = evaluate_model(local_model, loaders[sid]['test'], config.DEVICE, meta[sid]['minority_idx'])
+        seed_data["evaluation"]["local"][sid] = {
+            **{k: v for k, v in m.items() if k != 'cm'},
+            "lds_ratio": meta[sid]["lds_ratio"]
+        }
+        seed_data["confusion_matrices"][(sid, 'Lokal')] = m['cm']
+
+    # ---------------------------------------------------------
+    # 3. QUANTUM FEDERATED LEARNING (QFL)
+    # ---------------------------------------------------------
+    print(f"[{seed}] Starte QFL...")
+    global_model = QuantumModel(config.NUM_LAYERS, actual_type, n_p).to(config.DEVICE)
+
+    # History-Listen initialisieren (Inkl. global_step für Linearisierung)
     for sid in config.ALL_SUBCLIENTS:
-        l_model = QuantumModel(config.NUM_LAYERS, actual_type, n_p).to(config.DEVICE)
-        _, hist = train_local_model(
-            l_model,
-            loaders[sid]['train'],
-            loaders[sid]['val'],
-            torch.optim.Adam(l_model.parameters(), lr=config.LR),
-            config.EPOCHS_BASELINE,
-            config.DEVICE,
-            client_id=f"S{seed}_{sid}"
-        )
-        # Speichern der lokalen Historie für Konvergenzplots
-        seed_histories['Local Baseline'][sid] = hist
+        seed_data["training"]["qfl_local_history"][sid] = {
+            "round_idx": [], "epoch_in_round": [], "global_step": [],
+            "train_loss": [], "train_acc": [],
+            "val_loss": [], "val_acc": []
+        }
 
-        m = evaluate_model(
-            l_model,
-            loaders[sid]['test'],
-            config.DEVICE,
-            meta[sid]['minority_idx']
-        )
-        seed_histories['lds_cms'][(sid, 'Lokale Baseline')] = m['cm']
-        seed_results.append({
-            'Seed': seed,
-            'Szenario': 'Lokale Baseline',
-            'Noise_Type': actual_type or "None",
-            'Noise_P': n_p,
-            'Client': sid.split('_sub')[0],
-            'Subclient': sid.split('_sub_')[1],
-            'Testgenauigkeit': m['Testgenauigkeit'],
-            'Testverlust': m['Testverlust'],
-            'ROC_AUC': m['ROC_AUC'],
-            'PR_AUC': m['PR_AUC'],
-            'Recall_Minderheit': m['Recall_Minderheit'],
-            'F1_Minderheit': m['F1_Minderheit'],
-            'Balancierte_Genauigkeit': m['Balancierte_Genauigkeit']
-        })
-
-    # --- C. QUANTUM FEDERATED LEARNING ---
-    g_model = QuantumModel(config.NUM_LAYERS, actual_type, n_p).to(config.DEVICE)
-    qfl_global_conv = {'acc': [], 'loss': []}
+    final_local_models = {}
 
     for r in range(config.QFL_GLOBAL_ROUNDS):
         weights = []
+        current_locals = {}
+        # Offset berechnen: Wieviele Epochen wurden in vorigen Runden bereits trainiert?
+        step_offset = r * config.QFL_LOCAL_EPOCHS
+
         for sid in config.ALL_SUBCLIENTS:
             loc_m = QuantumModel(config.NUM_LAYERS, actual_type, n_p).to(config.DEVICE)
-            loc_m.load_state_dict(g_model.state_dict())
+            loc_m.load_state_dict(global_model.state_dict())
 
-            # Lokales Training
             w, h = train_local_model(
-                loc_m,
-                loaders[sid]['train'],
-                loaders[sid]['val'],
+                loc_m, loaders[sid]['train'], loaders[sid]['val'],
                 torch.optim.Adam(loc_m.parameters(), lr=config.LR),
-                config.QFL_LOCAL_EPOCHS,
-                config.DEVICE,
-                client_id=f"S{seed}_{sid}_R{r}"
+                config.QFL_LOCAL_EPOCHS, config.DEVICE, client_id=f"S{seed}_{sid}_R{r}"
             )
             weights.append(w)
-            # Sammeln jeder einzelnen lokalen Epoche
-            qfl_loc_accum[sid]['train_acc'].extend(h['train_acc'])
-            qfl_loc_accum[sid]['train_loss'].extend(h['train_loss'])
+            current_locals[sid] = loc_m
 
-        # Globale Aggregation
-        g_model.load_state_dict(aggregation.federated_averaging(weights))
+            # Linearisierte History Speicherung
+            for e_idx in range(len(h["train_loss"])):
+                hist = seed_data["training"]["qfl_local_history"][sid]
+                hist["round_idx"].append(r)
+                hist["epoch_in_round"].append(e_idx)
+                hist["global_step"].append(step_offset + e_idx)  # Fortschreibung der X-Achse
+                hist["train_loss"].append(h["train_loss"][e_idx])
+                hist["train_acc"].append(h["train_acc"][e_idx])
+                hist["val_loss"].append(h["val_loss"][e_idx])
+                hist["val_acc"].append(h["val_acc"][e_idx])
 
-        # Validierung der Runde
-        v = evaluate_model(g_model, g_val_loader, config.DEVICE)
-        qfl_global_conv['acc'].append(v['Testgenauigkeit'])
-        qfl_global_conv['loss'].append(v['Testverlust'])
+        # Aggregation via FedAvg
+        global_model.load_state_dict(aggregation.federated_averaging(weights))
 
-    for sid in config.ALL_SUBCLIENTS:
-        m = evaluate_model(
-            g_model,
-            loaders[sid]['test'],
-            config.DEVICE,
-            meta[sid]['minority_idx']
-        )
-        seed_histories['lds_cms'][(sid, 'QFL')] = m['cm']
-        seed_results.append({
-            'Seed': seed,
-            'Szenario': 'QFL',
-            'Noise_Type': actual_type or "None",
-            'Noise_P': n_p,
-            'Client': sid.split('_sub')[0],
-            'Subclient': sid.split('_sub_')[1],
-            'Testgenauigkeit': m['Testgenauigkeit'],
-            'Testverlust': m['Testverlust'],
-            'ROC_AUC': m['ROC_AUC'],
-            'PR_AUC': m['PR_AUC'],
-            'Recall_Minderheit': m['Recall_Minderheit'],
-            'F1_Minderheit': m['F1_Minderheit'],
-            'Balancierte_Genauigkeit': m['Balancierte_Genauigkeit']
-        })
+        # Runden-Validierung des aggregierten Modells
+        v_global = evaluate_model(global_model, g_val_loader, config.DEVICE)
+        seed_data["training"]["qfl_global_rounds"].append(v_global)
 
-    return seed_results, seed_histories, qfl_loc_accum, qfl_global_conv
+        if r == config.QFL_GLOBAL_ROUNDS - 1:
+            final_local_models = current_locals
 
+    # Final QFL Evaluation
+    torch.save(global_model.state_dict(), os.path.join(model_dir, f"S{seed}_QFL_Global_Final.pth"))
+
+    for base_client in config.BASE_CLIENTS:
+        rep_sub = f"{base_client}_sub_1"
+        m_glob = evaluate_model(global_model, loaders[rep_sub]['test'], config.DEVICE, meta[rep_sub]['minority_idx'])
+        seed_data["confusion_matrices"][(base_client, 'QFL_Global')] = m_glob['cm']
+
+        for i in range(1, config.NUM_SUBCLIENTS_PER_BASE + 1):
+            sid = f"{base_client}_sub_{i}"
+            # QFL Global Metriken (Wissenstransfer-Check)
+            seed_data["evaluation"]["qfl_global"][sid] = {
+                **{k: v for k, v in m_glob.items() if k != 'cm'},
+                "lds_ratio": meta[sid]["lds_ratio"]
+            }
+            # QFL Local Metriken (Personalisierungs-Check)
+            loc_m = final_local_models[sid]
+            m_loc = evaluate_model(loc_m, loaders[sid]['test'], config.DEVICE, meta[sid]['minority_idx'])
+            seed_data["evaluation"]["qfl_local"][sid] = {
+                **{k: v for k, v in m_loc.items() if k != 'cm'},
+                "lds_ratio": meta[sid]["lds_ratio"]
+            }
+            torch.save(loc_m.state_dict(), os.path.join(model_dir, f"S{seed}_QFL_{sid}_Local_Final.pth"))
+
+    # Daten-Persistenz pro Seed
+    hist_path = os.path.join(config.BASE_RESULTS_DIR, label, f"S{seed}_full_data.pkl")
+    with open(hist_path, "wb") as f:
+        pickle.dump(seed_data, f)
+
+    # JSON Export (Schlankes Monitoring ohne CMs)
+    json_view = convert_for_json({k: v for k, v in seed_data.items() if k != "confusion_matrices"})
+    with open(hist_path.replace(".pkl", ".json"), "w") as f:
+        json.dump(json_view, f, indent=2)
+
+    return seed_data
+
+
+# =============================================================================
+# MAIN EXECUTION
+# =============================================================================
 
 def main():
-    plots.setup_german_plot_style()
-    master_results = []
-    # Speicher für die Konvergenz-Evolution über p
-    evolution_master = {
-        nt: {0.0: None, 0.01: None, 0.05: None, 0.1: None} for nt in config.NOISE_TYPES
-    }
+    master_results_list = []
 
     for n_type, n_p in config.PHASE1_SCENARIOS:
         label = f"{n_type}_p{n_p}" if n_type != "None" else "Noiseless"
-        s_dir = os.path.join(config.BASE_RESULTS_DIR, label)
-        os.makedirs(s_dir, exist_ok=True)
         actual_type = None if n_type == "None" else n_type
+        scenario_dir = os.path.join(config.BASE_RESULTS_DIR, label)
+        os.makedirs(scenario_dir, exist_ok=True)
 
-        print(f"\n" + "=" * 80 + f"\n SZENARIO: {label.upper()}\n" + "=" * 80)
-
-        with ProcessPoolExecutor(max_workers=2) as executor:
+        # Parallelisierung über die Seeds
+        with ProcessPoolExecutor(max_workers=config.MAX_WORKERS) as executor:
             worker = functools.partial(
-                run_single_seed,
-                label=label,
-                actual_type=actual_type,
-                n_p=n_p,
-                rsna_root=config.RSNA_ROOT,
-                chexpert_root=config.CHEXPERT_ROOT
+                run_single_seed, label=label, actual_type=actual_type, n_p=n_p,
+                rsna_root=config.RSNA_ROOT, chexpert_root=config.CHEXPERT_ROOT,
+                is_first_run=(n_type == "None" and n_p == 0)
             )
-            results = list(executor.map(worker, config.SEEDS))
+            scenario_seeds_data = list(executor.map(worker, config.SEEDS))
 
-        # Datenaggregation für dieses Rausch-Szenario
-        scen_data = []
-        qfl_high_res_agg = []
-        qfl_round_agg = []
-        total_lds_cms = {}
-        hist_lb = {'Local Baseline': {s: [] for s in config.ALL_SUBCLIENTS}}
+        # Flachklopfen der Ergebnisse für den CSV-Export (Punkt 4)
+        rows = []
+        for s_data in scenario_seeds_data:
+            for strat_key in ["central", "local", "qfl_global", "qfl_local"]:
+                for sid, metrics in s_data["evaluation"][strat_key].items():
+                    rows.append({
+                        "Seed": s_data["metadata"]["seed"],
+                        "Szenario": STRAT_MAPPING[strat_key],
+                        "Noise_Label": label,
+                        "Client": "_".join(sid.split("_")[:2]),
+                        "Subclient": sid.split("_")[-1],
+                        **metrics  # Entpackt Metriken wie Accuracy, F1 etc.
+                    })
 
-        for s_res, s_hist, qfl_loc, qfl_glob in results:
-            scen_data.extend(s_res)
-            master_results.extend(s_res)
-            qfl_round_agg.append(qfl_glob)
-            for sid in config.ALL_SUBCLIENTS:
-                qfl_high_res_agg.append(qfl_loc[sid])
-                hist_lb['Local Baseline'][sid].append(s_hist['Local Baseline'][sid])
-            for k, cm in s_hist['lds_cms'].items():
-                total_lds_cms[k] = total_lds_cms.get(k, 0) + cm
+        df_scenario = pd.DataFrame(rows)
+        df_scenario.to_csv(os.path.join(scenario_dir, f"Summary_{label}.csv"), index=False)
+        master_results_list.append(df_scenario)
 
-        # Mittelwert für Evolution-Plots
-        mean_hist = {
-            'acc': np.mean([h['acc'] for h in qfl_round_agg], axis=0),
-            'loss': np.mean([h['loss'] for h in qfl_round_agg], axis=0)
-        }
-        if n_type == "None":
-            for nt in config.NOISE_TYPES:
-                evolution_master[nt][0.0] = mean_hist
-        else:
-            evolution_master[n_type][n_p] = mean_hist
+    # Globaler Master-CSV Export
+    master_df = pd.concat(master_results_list, ignore_index=True)
+    master_df.to_csv(os.path.join(config.BASE_RESULTS_DIR, "Master_Results.csv"), index=False)
 
-        df_scen = pd.DataFrame(scen_data)
-        flat_lb = [h for sl in hist_lb['Local Baseline'].values() for h in sl]
-
-        # --- SCENARIO-SPECIFIC PLOTS ---
-        plots.plot_training_comparison(
-            flat_lb,
-            qfl_high_res_agg,
-            label,
-            os.path.join(s_dir, "Training_Verlauf.png")
-        )
-        plots.plot_global_comparison_summary(df_scen, s_dir)
-        plots.plot_paper_style_boxplot(df_scen, s_dir)
-        plots.plot_recall_improvement_lds(df_scen, s_dir)
-
-        # Konvergenz-Verzögerung für dieses p
-        plots.plot_convergence_speed_comparison(
-            flat_lb,
-            qfl_high_res_agg,
-            s_dir
-        )
-
-        for sid in ['client_1_sub_1', 'client_4_sub_1']:
-            if (sid, 'Lokale Baseline') in total_lds_cms and (sid, 'QFL') in total_lds_cms:
-                plots.plot_confusion_matrix_comparison(
-                    total_lds_cms[(sid, 'Lokale Baseline')],
-                    total_lds_cms[(sid, 'QFL')],
-                    sid,
-                    s_dir
-                )
-
-    # --- MASTER ANALYSEN ---
-    master_df = pd.DataFrame(master_results)
-    master_df.to_csv(
-        os.path.join(config.BASE_RESULTS_DIR, "Master_Ergebnisse.csv"),
-        index=False
-    )
-
-    # Übergreifende Analysen über alle p-Werte hinweg
-    plots.plot_master_noise_sensitivity(master_df, config.BASE_RESULTS_DIR)
-    plots.plot_noise_rescue_erosion(master_df, config.BASE_RESULTS_DIR)
-    plots.plot_skew_noise_heatmap(master_df, config.BASE_RESULTS_DIR)
-    plots.plot_stability_analysis(master_df, config.BASE_RESULTS_DIR)
-
-    # Neue Master-Plots aus Phase 1
-    plots.plot_noise_type_impact_ranking(master_df, config.BASE_RESULTS_DIR)
-    plots.plot_critical_thresholds_annotated(master_df, config.BASE_RESULTS_DIR)
-
-    for nt in config.NOISE_TYPES:
-        if evolution_master[nt][0.0] is not None:
-            plots.plot_noise_evolution_convergence(
-                evolution_master[nt],
-                nt,
-                config.BASE_RESULTS_DIR
-            )
-
-    print(f"\n✔ Alle Experimente abgeschlossen. Ergebnisse: {config.BASE_RESULTS_DIR}")
+    print("\n" + "=" * 50)
+    print("✅ SIMULATION ERFOLGREICH BEENDET")
+    print(f"Ergebnisse gespeichert in: {config.BASE_RESULTS_DIR}")
+    print("=" * 50)
 
 
 if __name__ == "__main__":
