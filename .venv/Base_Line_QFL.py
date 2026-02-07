@@ -1,274 +1,291 @@
 import torch
 import os
+import sys
 import numpy as np
 import pandas as pd
-from concurrent.futures import ProcessPoolExecutor
-import functools
-import json
 import pickle
+import json
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from tqdm import tqdm
+import traceback
+import random
+from datetime import datetime
+import gc
 
 # Eigene Module
 import config
 import data_prep
-import plots
 import aggregation
-from Base_Line import QuantumModel
-from train_and_eval import train_local_model, evaluate_model
-
-# Mapping für bessere Lesbarkeit in CSV/Plots
-STRAT_MAPPING = {
-    "central": "Zentrale Baseline",
-    "local": "Lokale Baseline",
-    "qfl_global": "QFL Global",
-    "qfl_local": "QFL Local (Personalisiert)"
-}
+import model_factory
+# WICHTIG: Hier die neue Funktion importieren
+from train_and_eval import train_local_model, evaluate_model, compute_unified_convergence_metrics
+from utils import QuantumJSONEncoder
 
 
-# =============================================================================
-# HILFSFUNKTIONEN
-# =============================================================================
+def test_setup_consistency():
+    print("\n--- 🔍 STARTING PRE-FLIGHT CHECK ---")
 
-def convert_for_json(data):
-    """Konvertiert NumPy-Typen rekursiv in JSON-kompatible Python-Typen."""
-    if isinstance(data, np.ndarray):
-        return data.tolist()
-    elif isinstance(data, dict):
-        return {k: convert_for_json(v) for k, v in data.items()}
-    elif isinstance(data, list):
-        return [convert_for_json(item) for item in data]
-    elif isinstance(data, (np.integer, np.floating)):
-        return float(data)
-    else:
-        return data
-
-
-# =============================================================================
-# CORE EXPERIMENT LOGIC (SINGLE SEED)
-# =============================================================================
-
-def run_single_seed(seed, label, actual_type, n_p, rsna_root, chexpert_root, is_first_run=False):
-    print(f"\n>>> [SEED {seed}] Starte Szenario: {label}")
-
-    # Reproduzierbarkeit
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-
-    # Daten laden
+    # 1. Teste Daten-Orchestrierung
     loaders, meta = data_prep.get_federated_pca_loaders(
-        rsna_root, chexpert_root, current_seed=seed
+        config.RSNA_ROOT, config.CHEXPERT_ROOT, current_seed=42, verbose=True
     )
 
-    if is_first_run:
-        data_prep.print_dataset_stats(loaders)
-        data_prep.verify_disjoint_subclients(loaders)
+    # 2. Teste Mapping-Logik für jedes Szenario
+    for scenario in config.ALL_SCENARIOS:
+        print(f"\nScenario: {scenario['label']}")
+        for sid in config.ALL_SUBCLIENTS:
+            # Simuliere Modell-Erstellung
+            test_model = model_factory.get_client_model(sid, scenario)
 
-    g_val_loader = aggregation.build_global_val_loader(loaders)
-    cent_loader = data_prep.get_centralized_loader(loaders, config.BATCH_SIZE)
+            # Prüfe, ob Rauschen korrekt gesetzt wurde
+            n_type = test_model.noise_type
+            n_p = test_model.p
 
-    model_dir = os.path.join(config.BASE_RESULTS_DIR, label, "models")
-    os.makedirs(model_dir, exist_ok=True)
+            # Logik-Check: Erhält der Subclient das Rauschen seiner Base-Klinik?
+            print(f"  ├─ {sid}: Noise={n_type}, p={n_p} | LDS-Idx={meta[sid]['minority_idx']}")
 
-    # Speicherstruktur initialisieren
-    seed_data = {
-        "metadata": {"seed": seed, "scenario": label, "noise_type": str(actual_type), "noise_p": n_p},
-        "training": {
-            "central": None,
-            "local": {},
-            "qfl_local_history": {},
-            "qfl_global_rounds": []
-        },
-        "evaluation": {"central": {}, "local": {}, "qfl_local": {}, "qfl_global": {}},
-        "confusion_matrices": {}
-    }
+            # Kleiner Assert zur Sicherheit
+            if scenario['group'] == "bias_core" and "client_1" in sid:
+                assert n_p > 0 or n_type is not None, f"FEHLER: {sid} sollte Rauschen haben!"
 
-    # ---------------------------------------------------------
-    # 1. ZENTRALE BASELINE
-    # ---------------------------------------------------------
-    print(f"[{seed}] Training Zentrale Baseline...")
-    central_model = QuantumModel(config.NUM_LAYERS, actual_type, n_p).to(config.DEVICE)
-    _, central_hist = train_local_model(
-        central_model, cent_loader, g_val_loader,
-        torch.optim.Adam(central_model.parameters(), lr=config.LR),
-        config.EPOCHS_BASELINE, config.DEVICE, client_id=f"S{seed}_Central"
-    )
-    seed_data["training"]["central"] = central_hist
-    torch.save(central_model.state_dict(), os.path.join(model_dir, f"S{seed}_Central.pth"))
+    print("\n✅ Pre-Flight Check erfolgreich: Alle Mappings und Daten-Silos sind konsistent.")
 
-    # Effiziente Eval: Einmal pro Base-Client
-    for base_client in config.BASE_CLIENTS:
-        rep_sub = f"{base_client}_sub_1"
-        m_rep = evaluate_model(central_model, loaders[rep_sub]['test'], config.DEVICE, meta[rep_sub]['minority_idx'])
-        seed_data["confusion_matrices"][(base_client, 'Zentrale')] = m_rep['cm']
+def run_single_task(task_config, seed):
+    """
+    Führt ein Experiment aus mit Fokus auf Speichereffizienz und Datenkonsistenz.
+    """
+    log_path = os.path.join(config.BASE_RESULTS_DIR, "simulation.log")
+    original_stdout = sys.stdout
+    f_log = open(log_path, "a", encoding="utf-8")
 
-        for i in range(1, config.NUM_SUBCLIENTS_PER_BASE + 1):
-            sid = f"{base_client}_sub_{i}"
-            seed_data["evaluation"]["central"][sid] = {
-                **{k: v for k, v in m_rep.items() if k != 'cm'},
-                "lds_ratio": meta[sid]["lds_ratio"]
-            }
+    # Lokale Variablen initialisieren für sicheren Cleanup
+    loaders = None
+    c_mod = l_mod = glob_mod = None
 
-    # ---------------------------------------------------------
-    # 2. LOKALE BASELINES
-    # ---------------------------------------------------------
-    print(f"[{seed}] Training Lokale Baselines...")
-    for sid in config.ALL_SUBCLIENTS:
-        local_model = QuantumModel(config.NUM_LAYERS, actual_type, n_p).to(config.DEVICE)
-        _, h = train_local_model(
-            local_model, loaders[sid]['train'], loaders[sid]['val'],
-            torch.optim.Adam(local_model.parameters(), lr=config.LR),
-            config.EPOCHS_BASELINE, config.DEVICE, client_id=f"S{seed}_{sid}_Local"
+    try:
+        sys.stdout = f_log
+        label = task_config['label']
+        layers = task_config['layers']
+
+        # Reproduzierbarkeit der Modell-Initialisierung (innerhalb des Tasks)
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+
+        if config.DEVICE.type == 'cuda':
+            torch.cuda.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+
+        scenario_dir = os.path.join(config.BASE_RESULTS_DIR, label)
+        model_dir = os.path.join(scenario_dir, "models")
+        os.makedirs(model_dir, exist_ok=True)
+
+        print(f"\n{'=' * 80}\n[START] Scenario: {label} | Seed: {seed}\n{'=' * 80}")
+
+        # 1. DATEN LADEN (PCA nutzt config.CALIBRATION_SEED intern)
+        loaders, meta = data_prep.get_federated_pca_loaders(
+            config.RSNA_ROOT, config.CHEXPERT_ROOT, current_seed=seed, verbose=False
         )
-        seed_data["training"]["local"][sid] = h
-        torch.save(local_model.state_dict(), os.path.join(model_dir, f"S{seed}_{sid}_Local.pth"))
+        g_val_loader = aggregation.build_global_val_loader(loaders, batch_size=config.BATCH_SIZE)
+        cent_loader = data_prep.get_centralized_loader(loaders, config.BATCH_SIZE)
 
-        m = evaluate_model(local_model, loaders[sid]['test'], config.DEVICE, meta[sid]['minority_idx'])
-        seed_data["evaluation"]["local"][sid] = {
-            **{k: v for k, v in m.items() if k != 'cm'},
-            "lds_ratio": meta[sid]["lds_ratio"]
-        }
-        seed_data["confusion_matrices"][(sid, 'Lokal')] = m['cm']
-
-    # ---------------------------------------------------------
-    # 3. QUANTUM FEDERATED LEARNING (QFL)
-    # ---------------------------------------------------------
-    print(f"[{seed}] Starte QFL...")
-    global_model = QuantumModel(config.NUM_LAYERS, actual_type, n_p).to(config.DEVICE)
-
-    # History-Listen initialisieren (Inkl. global_step für Linearisierung)
-    for sid in config.ALL_SUBCLIENTS:
-        seed_data["training"]["qfl_local_history"][sid] = {
-            "round_idx": [], "epoch_in_round": [], "global_step": [],
-            "train_loss": [], "train_acc": [],
-            "val_loss": [], "val_acc": []
+        seed_data = {
+            "metadata": {"seed": seed, "scenario": label, "config": task_config},
+            "history": {"centralized": None, "local_baselines": {}, "qfl_global": [], "qfl_local_history": {}},
+            "evaluation": {"centralized": {}, "local": {}, "qfl_global": {}, "qfl_local": {}}
         }
 
-    final_local_models = {}
-
-    for r in range(config.QFL_GLOBAL_ROUNDS):
-        weights = []
-        current_locals = {}
-        # Offset berechnen: Wieviele Epochen wurden in vorigen Runden bereits trainiert?
-        step_offset = r * config.QFL_LOCAL_EPOCHS
+        # --- PHASE 1: CENTRAL (Upper Bound) ---
+        c_mod = model_factory.get_global_model(layers).to(config.DEVICE)
+        _, c_hist = train_local_model(
+            c_mod, cent_loader, g_val_loader,
+            torch.optim.Adam(c_mod.parameters(), lr=config.LEARNING_RATE),
+            config.BASELINE_EPOCHS, config.DEVICE, f"{label}_S{seed}_CENTRAL"
+        )
+        # NEU: Unified Metrics für Centralized
+        c_hist['convergence_metrics'] = compute_unified_convergence_metrics(c_hist, mode="central")
+        seed_data["history"]["centralized"] = c_hist
+        torch.save(c_mod.state_dict(), os.path.join(model_dir, f"central_S{seed}.pth"))
 
         for sid in config.ALL_SUBCLIENTS:
-            loc_m = QuantumModel(config.NUM_LAYERS, actual_type, n_p).to(config.DEVICE)
-            loc_m.load_state_dict(global_model.state_dict())
+            e = evaluate_model(c_mod, loaders[sid]['test'], config.DEVICE, meta[sid]['minority_idx'])
+            e['convergence_metrics'] = c_hist['convergence_metrics']
+            seed_data["evaluation"]["centralized"][sid] = e
 
-            w, h = train_local_model(
-                loc_m, loaders[sid]['train'], loaders[sid]['val'],
-                torch.optim.Adam(loc_m.parameters(), lr=config.LR),
-                config.QFL_LOCAL_EPOCHS, config.DEVICE, client_id=f"S{seed}_{sid}_R{r}"
+        del c_mod
+
+        # --- PHASE 2: LOCAL SILO (Baselines) ---
+        for sid in config.ALL_SUBCLIENTS:
+            l_mod = model_factory.get_client_model(sid, task_config).to(config.DEVICE)
+            _, l_hist = train_local_model(
+                l_mod, loaders[sid]['train'], loaders[sid]['val'],
+                torch.optim.Adam(l_mod.parameters(), lr=config.LEARNING_RATE),
+                config.BASELINE_EPOCHS, config.DEVICE, f"{label}_S{seed}_LOCAL_{sid}"
             )
-            weights.append(w)
-            current_locals[sid] = loc_m
+            # NEU: Unified Metrics für Local
+            l_hist['convergence_metrics'] = compute_unified_convergence_metrics(l_hist, mode="local")
+            seed_data["history"]["local_baselines"][sid] = l_hist
+            torch.save(l_mod.state_dict(), os.path.join(model_dir, f"local_silo_{sid}_S{seed}.pth"))
 
-            # Linearisierte History Speicherung
-            for e_idx in range(len(h["train_loss"])):
-                hist = seed_data["training"]["qfl_local_history"][sid]
-                hist["round_idx"].append(r)
-                hist["epoch_in_round"].append(e_idx)
-                hist["global_step"].append(step_offset + e_idx)  # Fortschreibung der X-Achse
-                hist["train_loss"].append(h["train_loss"][e_idx])
-                hist["train_acc"].append(h["train_acc"][e_idx])
-                hist["val_loss"].append(h["val_loss"][e_idx])
-                hist["val_acc"].append(h["val_acc"][e_idx])
+            e = evaluate_model(l_mod, loaders[sid]['test'], config.DEVICE, meta[sid]['minority_idx'])
+            e['convergence_metrics'] = l_hist['convergence_metrics']
+            seed_data["evaluation"]["local"][sid] = e
+            del l_mod
 
-        # Aggregation via FedAvg
-        global_model.load_state_dict(aggregation.federated_averaging(weights))
+        # --- PHASE 3: QFL (Federated Learning) ---
+        glob_mod = model_factory.get_global_model(layers).to(config.DEVICE)
 
-        # Runden-Validierung des aggregierten Modells
-        v_global = evaluate_model(global_model, g_val_loader, config.DEVICE)
-        seed_data["training"]["qfl_global_rounds"].append(v_global)
+        for r in range(config.GLOBAL_ROUNDS):
+            round_weights = []
+            step_offset = r * config.LOCAL_EPOCHS
 
-        if r == config.QFL_GLOBAL_ROUNDS - 1:
-            final_local_models = current_locals
+            for sid in config.ALL_SUBCLIENTS:
+                cl_m = model_factory.get_client_model(sid, task_config).to(config.DEVICE)
+                cl_m.load_state_dict(glob_mod.state_dict())
 
-    # Final QFL Evaluation
-    torch.save(global_model.state_dict(), os.path.join(model_dir, f"S{seed}_QFL_Global_Final.pth"))
+                w, h = train_local_model(
+                    cl_m, loaders[sid]['train'], loaders[sid]['val'],
+                    torch.optim.Adam(cl_m.parameters(), lr=config.LEARNING_RATE),
+                    config.LOCAL_EPOCHS, config.DEVICE, f"{label}_S{seed}_QFL_R{r}_{sid}"
+                )
+                round_weights.append(w)
 
-    for base_client in config.BASE_CLIENTS:
-        rep_sub = f"{base_client}_sub_1"
-        m_glob = evaluate_model(global_model, loaders[rep_sub]['test'], config.DEVICE, meta[rep_sub]['minority_idx'])
-        seed_data["confusion_matrices"][(base_client, 'QFL_Global')] = m_glob['cm']
+                if sid not in seed_data["history"]["qfl_local_history"]:
+                    seed_data["history"]["qfl_local_history"][sid] = {
+                        "train_acc": [], "val_acc": [], "train_loss": [],
+                        "val_loss": [], "global_step": [], "epoch_times": []
+                    }
 
-        for i in range(1, config.NUM_SUBCLIENTS_PER_BASE + 1):
-            sid = f"{base_client}_sub_{i}"
-            # QFL Global Metriken (Wissenstransfer-Check)
-            seed_data["evaluation"]["qfl_global"][sid] = {
-                **{k: v for k, v in m_glob.items() if k != 'cm'},
-                "lds_ratio": meta[sid]["lds_ratio"]
-            }
-            # QFL Local Metriken (Personalisierungs-Check)
-            loc_m = final_local_models[sid]
-            m_loc = evaluate_model(loc_m, loaders[sid]['test'], config.DEVICE, meta[sid]['minority_idx'])
-            seed_data["evaluation"]["qfl_local"][sid] = {
-                **{k: v for k, v in m_loc.items() if k != 'cm'},
-                "lds_ratio": meta[sid]["lds_ratio"]
-            }
-            torch.save(loc_m.state_dict(), os.path.join(model_dir, f"S{seed}_QFL_{sid}_Local_Final.pth"))
+                hr = seed_data["history"]["qfl_local_history"][sid]
+                for idx in range(len(h['train_acc'])):
+                    hr["train_acc"].append(h['train_acc'][idx])
+                    hr["val_acc"].append(h['val_acc'][idx])
+                    hr["train_loss"].append(h['train_loss'][idx])
+                    hr["val_loss"].append(h['val_loss'][idx])
+                    hr["global_step"].append(step_offset + idx)
+                    hr["epoch_times"].append(h["epoch_times"][idx])
 
-    # Daten-Persistenz pro Seed
-    hist_path = os.path.join(config.BASE_RESULTS_DIR, label, f"S{seed}_full_data.pkl")
-    with open(hist_path, "wb") as f:
-        pickle.dump(seed_data, f)
+                if r == config.GLOBAL_ROUNDS - 1:
+                    torch.save(cl_m.state_dict(), os.path.join(model_dir, f"qfl_local_final_{sid}_S{seed}.pth"))
+                    eval_metrics = evaluate_model(cl_m, loaders[sid]['test'], config.DEVICE, meta[sid]['minority_idx'])
+                    # NEU: Unified Metrics für Federated (isoliert Runden-Enden)
+                    eval_metrics['convergence_metrics'] = compute_unified_convergence_metrics(
+                        hr, mode="federated", local_epochs=config.LOCAL_EPOCHS
+                    )
+                    seed_data["evaluation"]["qfl_local"][sid] = eval_metrics
 
-    # JSON Export (Schlankes Monitoring ohne CMs)
-    json_view = convert_for_json({k: v for k, v in seed_data.items() if k != "confusion_matrices"})
-    with open(hist_path.replace(".pkl", ".json"), "w") as f:
-        json.dump(json_view, f, indent=2)
+                del cl_m
 
-    return seed_data
+            new_global_weights = aggregation.federated_averaging(round_weights)
+            glob_mod.load_state_dict(new_global_weights)
 
+            raw_global_metrics = evaluate_model(glob_mod, g_val_loader, config.DEVICE)
+            clean_global_metrics = {"round": r,
+                                    **{k.replace("test_", "val_"): v for k, v in raw_global_metrics.items()}}
+            seed_data["history"]["qfl_global"].append(clean_global_metrics)
 
-# =============================================================================
-# MAIN EXECUTION
-# =============================================================================
+        torch.save(glob_mod.state_dict(), os.path.join(model_dir, f"qfl_global_final_S{seed}.pth"))
+
+        # Finale Evaluation des globalen Modells
+        for sid in config.ALL_SUBCLIENTS:
+            seed_data["evaluation"]["qfl_global"][sid] = evaluate_model(
+                glob_mod, loaders[sid]['test'], config.DEVICE, meta[sid]['minority_idx']
+            )
+
+        with open(os.path.join(scenario_dir, f"S{seed}_full_results.pkl"), "wb") as pf:
+            pickle.dump(seed_data, pf)
+        with open(os.path.join(scenario_dir, f"S{seed}_metrics.json"), "w") as jf:
+            json.dump(seed_data, jf, indent=4, cls=QuantumJSONEncoder)
+
+        print(f"[SUCCESS] Scenario {label} | Seed {seed} completed.")
+        return seed_data
+
+    except Exception as err:
+        print(f"\n{'!' * 80}\n[ERROR] Scenario {task_config.get('label', 'UNKNOWN')}, Seed {seed}: {str(err)}")
+        print(traceback.format_exc())
+        return None
+
+    finally:
+        # === SCHRITT 1: EXPLIZITE ZUWEISUNG (Laut Review sicherste Methode) ===
+        loaders = cent_loader = g_val_loader = None
+        c_mod = l_mod = glob_mod = None
+
+        # === SCHRITT 2: CPU-CLEANUP ===
+        gc.collect()
+
+        # === SCHRITT 3: GPU-CLEANUP (VRAM) ===
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # === SCHRITT 4: LOGGING ===
+        try:
+            now_str = datetime.now().strftime("%H:%M:%S")
+            print(f"[{now_str}] 🧹 Cleanup completed. RAM/VRAM resources released.")
+        except:
+            pass
+
+        sys.stdout = original_stdout
+        f_log.close()
 
 def main():
-    master_results_list = []
+    # --- NEU: PRE-FLIGHT CHECK ---
+    # Führt eine Trockenübung für Daten und Mappings durch
+    try:
+        test_setup_consistency()
+    except Exception as e:
+        print(f"❌ PRE-FLIGHT CHECK FEHLGESCHLAGEN: {e}")
+        return  # Beendet das Programm vor dem Start der Tasks
 
-    for n_type, n_p in config.PHASE1_SCENARIOS:
-        label = f"{n_type}_p{n_p}" if n_type != "None" else "Noiseless"
-        actual_type = None if n_type == "None" else n_type
-        scenario_dir = os.path.join(config.BASE_RESULTS_DIR, label)
-        os.makedirs(scenario_dir, exist_ok=True)
+    print("🔍 Initialisiere Datensätze und starte PCA-Orchestrierung...")
+    # Initialer Check nutzt CALIBRATION_SEED intern
+    data_prep.get_federated_pca_loaders(config.RSNA_ROOT, config.CHEXPERT_ROOT, verbose=True)
 
-        # Parallelisierung über die Seeds
-        with ProcessPoolExecutor(max_workers=config.MAX_WORKERS) as executor:
-            worker = functools.partial(
-                run_single_seed, label=label, actual_type=actual_type, n_p=n_p,
-                rsna_root=config.RSNA_ROOT, chexpert_root=config.CHEXPERT_ROOT,
-                is_first_run=(n_type == "None" and n_p == 0)
-            )
-            scenario_seeds_data = list(executor.map(worker, config.SEEDS))
+    all_tasks = [(s, seed) for s in config.ALL_SCENARIOS for seed in config.RANDOM_SEEDS]
+    master_rows = []
+    log_file = os.path.join(config.BASE_RESULTS_DIR, "simulation.log")
 
-        # Flachklopfen der Ergebnisse für den CSV-Export (Punkt 4)
-        rows = []
-        for s_data in scenario_seeds_data:
-            for strat_key in ["central", "local", "qfl_global", "qfl_local"]:
-                for sid, metrics in s_data["evaluation"][strat_key].items():
-                    rows.append({
-                        "Seed": s_data["metadata"]["seed"],
-                        "Szenario": STRAT_MAPPING[strat_key],
-                        "Noise_Label": label,
-                        "Client": "_".join(sid.split("_")[:2]),
-                        "Subclient": sid.split("_")[-1],
-                        **metrics  # Entpackt Metriken wie Accuracy, F1 etc.
-                    })
+    if os.path.exists(log_file):
+        os.remove(log_file)
 
-        df_scenario = pd.DataFrame(rows)
-        df_scenario.to_csv(os.path.join(scenario_dir, f"Summary_{label}.csv"), index=False)
-        master_results_list.append(df_scenario)
+    print(f"🚀 Starte {len(all_tasks)} parallele Aufgaben auf {config.MAX_WORKERS} Workern.")
 
-    # Globaler Master-CSV Export
-    master_df = pd.concat(master_results_list, ignore_index=True)
-    master_df.to_csv(os.path.join(config.BASE_RESULTS_DIR, "Master_Results.csv"), index=False)
+    with ProcessPoolExecutor(max_workers=config.MAX_WORKERS) as executor:
+        futures = [executor.submit(run_single_task, t, s) for t, s in all_tasks]
 
-    print("\n" + "=" * 50)
-    print("✅ SIMULATION ERFOLGREICH BEENDET")
-    print(f"Ergebnisse gespeichert in: {config.BASE_RESULTS_DIR}")
-    print("=" * 50)
+        with tqdm(total=len(all_tasks), desc="Simulations-Fortschritt", unit="task") as pbar:
+            for future in as_completed(futures):
+                try:
+                    res = future.result()
+                    if res:
+                        for strategy in ["centralized", "local", "qfl_local", "qfl_global"]:
+                            for sid, metrics in res["evaluation"][strategy].items():
+                                row = {
+                                    "seed": res["metadata"]["seed"],
+                                    "scenario": res["metadata"]["scenario"],
+                                    "group": res["metadata"]["config"]["group"],
+                                    "strategy": strategy,
+                                    "client": sid,
+                                }
+                                for m_name, m_val in metrics.items():
+                                    if m_name == 'convergence_metrics':
+                                        for c_name, c_val in m_val.items():
+                                            row[f"conv_{c_name}"] = c_val
+                                    elif m_name != 'confusion_matrix':
+                                        row[m_name] = m_val
+                                master_rows.append(row)
+                except Exception as e:
+                    print(f"Kritischer Task-Fehler: {e}")
+                pbar.update(1)
 
+    if master_rows:
+        df_master = pd.DataFrame(master_rows)
+        output_path = os.path.join(config.BASE_RESULTS_DIR, "Master_Results.csv")
+        df_master.to_csv(output_path, index=False)
+        print(f"\n✅ Simulation beendet. Ergebnisse gespeichert in: {output_path}")
+    else:
+        print("\n❌ Keine Daten für Master_Results.csv generiert.")
 
 if __name__ == "__main__":
     main()

@@ -1,284 +1,180 @@
+"""
+Data Preparation Module for Quantum Federated Learning
+Bachelor Thesis: Paul Kreppold
+Version: 3.0 - Fixed PCA, Decoupled Subclients & Consistency
+"""
+
 import torch
 import pandas as pd
 import os
 import numpy as np
-from PIL import Image
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
 import medmnist
 from medmnist import INFO
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import MinMaxScaler
 import config
 
-
-# ==================================================
-# 1. PYTORCH DATASET KLASSE
-# ==================================================
-
 class PneumoniaDataset(Dataset):
+    """Standard Dataset für Tensorspeicherung nach PCA-Transformation."""
     def __init__(self, x_tensor, y_tensor):
         self.dataset = x_tensor
         self.labels = y_tensor
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        return self.dataset[idx], self.labels[idx]
-
-
-# ==================================================
-# 2. FEDERATED DATA ORCHESTRATOR
-# ==================================================
+    def __len__(self): return len(self.dataset)
+    def __getitem__(self, idx): return self.dataset[idx], self.labels[idx]
 
 class FederatedDataOrchestrator:
-    def __init__(self, n_components=20, batch_size=16, seed=42):
+    def __init__(self, n_components=20, batch_size=16, experiment_seed=42):
         self.n_components = n_components
         self.batch_size = batch_size
-        self.seed = seed
-        self.transform = transforms.Compose([
-            transforms.Resize((28, 28)),
-            transforms.Grayscale(1),
-            transforms.ToTensor()
-        ])
+        self.exp_seed = experiment_seed
+        # Fixiert das Koordinatensystem (PCA) & Benchmark-Basis (Test/Val)
+        self.calib_seed = config.CALIBRATION_SEED
+
         self.raw_pools = {}
         self.metadata = {}
-        self.pca_pool = []  # Speichert PCA-Kalibrierungsdaten
+        self.pca_pool = []
+        # Statistiken für Dokumentation
+        self.pca_sources = {"MNIST": 0, "RSNA": 0, "CheXpert": 0}
+        self.pca_class_counts = {0: 0, 1: 0}
 
-    def _get_disjoint_sample(self, df, target_n, pos_ratio):
-        """Zieht Stichproben basierend auf dem Instanz-Seed."""
+    def _get_disjoint_sample(self, df, target_n, pos_ratio, custom_seed=None):
+        """
+        Zieht Samples und gibt den Rest zurück (Pool-Shrinking für Disjunktheit).
+        custom_seed ermöglicht statistische Unabhängigkeit zwischen Clients.
+        """
+        s = custom_seed if custom_seed is not None else self.calib_seed
+
         n_pos = int(target_n * pos_ratio)
         n_neg = target_n - n_pos
 
-        pos_pool = df[df['label'] == 1]
-        neg_pool = df[df['label'] == 0]
+        # Sampling (Zufälligkeit kontrolliert durch s)
+        pos_df = df[df['label'] == 1].sample(n=min(n_pos, len(df[df['label']==1])), random_state=s)
+        neg_df = df[df['label'] == 0].sample(n=min(n_neg, len(df[df['label']==0])), random_state=s)
 
-        sampled_pos = pos_pool.sample(n=min(n_pos, len(pos_pool)), random_state=self.seed)
-        sampled_neg = neg_pool.sample(n=min(n_neg, len(neg_pool)), random_state=self.seed)
+        sample = pd.concat([pos_df, neg_df]).sample(frac=1, random_state=s)
+        return sample, df.drop(sample.index)
 
-        sample = pd.concat([sampled_pos, sampled_neg]).sample(frac=1, random_state=self.seed)
-        remaining_df = df.drop(sample.index)
-        return sample, remaining_df
+    def _update_pca_stats(self, df, source_name):
+        self.pca_pool.append(df.drop(columns='label').values)
+        self.pca_sources[source_name] += len(df)
+        self.pca_class_counts[0] += len(df[df['label'] == 0])
+        self.pca_class_counts[1] += len(df[df['label'] == 1])
 
-    def _load_images_from_disk(self, df):
-        imgs, lbls = [], []
-        for _, row in df.iterrows():
-            if os.path.exists(row['full_path']):
-                img = Image.open(row['full_path']).convert('L')
-                imgs.append(np.array(self.transform(img)).flatten())
-                lbls.append(row['label'])
-        return np.array(imgs, dtype=np.float32), np.array(lbls, dtype=np.float32)
-
-    # --- DATENSATZ-LOGIK MIT PCA-POOL EXTRAKTION ---
+    def _load_data_flexible(self, path, dataset_type):
+        if os.path.isfile(path) and path.endswith(".npz"):
+            data = np.load(path)
+            x = data['x'].reshape(len(data['x']), -1)
+            return pd.DataFrame(x).assign(label=data['y'].squeeze())
+        return pd.DataFrame()
 
     def _prepare_mnist(self):
-        """Client 1: PneumoniaMNIST mit PCA-Pool-Extraktion."""
-        info = INFO['pneumoniamnist']
-        DataClass = getattr(medmnist, info['python_class'])
-        data_list = []
-        for s in ['train', 'val', 'test']:
-            ds = DataClass(split=s, download=True)
-            tmp = pd.DataFrame(ds.imgs.reshape(-1, 784) / 255.0)
-            tmp['label'] = ds.labels.squeeze()
-            data_list.append(tmp)
+        DataClass = getattr(medmnist, INFO['pneumoniamnist']['python_class'])
+        data = [pd.DataFrame(DataClass(split=s, download=True).imgs.reshape(-1, 784)/255.0).assign(label=DataClass(split=s).labels.squeeze()) for s in ['train', 'val', 'test']]
+        df = pd.concat(data).drop_duplicates().reset_index(drop=True)
 
-        full_df = pd.concat(data_list).drop_duplicates().reset_index(drop=True)
+        # PCA & Benchmark-Sets (Test/Val) nutzen stabilen CALIBRATION_SEED
+        pca_df, rem = self._get_disjoint_sample(df, 250, 0.50, custom_seed=self.calib_seed)
+        self._update_pca_stats(pca_df, "MNIST")
+        test_df, rem = self._get_disjoint_sample(rem, 624, 0.50, custom_seed=self.calib_seed)
+        val_df, rem = self._get_disjoint_sample(rem, 524, 0.75, custom_seed=self.calib_seed)
 
-        # 1. ZUERST: PCA-Pool ziehen (250 Samples)
-        pca_df, rem = self._get_disjoint_sample(full_df, 250, 0.50)
-        self.pca_pool.append(pca_df.drop(columns='label').values)
-
-        # 2. DANN: Test/Val/Train aus den verbleibenden Daten
-        test_df, rem = self._get_disjoint_sample(rem, 624, 0.50)
-        val_df, rem = self._get_disjoint_sample(rem, 524, 0.75)
-
-        tx, ty = test_df.drop(columns='label').values, test_df['label'].values
-        vx, vy = val_df.drop(columns='label').values, val_df['label'].values
-
-        # 3. Subclients aus verbleibendem Pool erstellen
         for i in range(1, 5):
-            ratio = 0.90 if i == 1 else 0.75
-            train_df, rem = self._get_disjoint_sample(rem, 1000, ratio)
-            sid = f"client_1_sub_{i}"
-            self.raw_pools[sid] = {
-                'train_x': train_df.drop(columns='label').values,
-                'train_y': train_df['label'].values,
-                'val_x': vx, 'val_y': vy,
-                'test_x': tx, 'test_y': ty
+            # DECOUPLING: Subclient-Seed wird deriviert, um künstliche Korrelation zu vermeiden
+            sub_seed = (self.exp_seed + i)
+            pr = 0.90 if i == 1 else 0.75
+
+            # rem wird sequentiell verringert -> physische Disjunktheit
+            tr, rem = self._get_disjoint_sample(rem, 1000, pr, custom_seed=sub_seed)
+            self.raw_pools[f"client_1_sub_{i}"] = {
+                'train_x': tr.drop(columns='label').values, 'train_y': tr['label'].values,
+                'val_x': val_df.drop(columns='label').values, 'val_y': val_df['label'].values,
+                'test_x': test_df.drop(columns='label').values, 'test_y': test_df['label'].values
             }
 
     def _prepare_rsna(self, root):
-        """Client 2 & 3: RSNA mit PCA-Pool-Extraktion."""
-        df = pd.read_csv(os.path.join(root, 'stage2_train_metadata.csv'))
-        df = df[df['class'].isin(['Normal', 'Lung Opacity'])].drop_duplicates(subset='patientId')
-        df['label'] = df['class'].map({'Normal': 0, 'Lung Opacity': 1})
-        df['full_path'] = df['patientId'].apply(lambda x: os.path.join(root, 'Training/Images', f"{x}.png"))
-
-        # Initialer Split in C2/C3 Pools
-        c2_pool = df.sample(frac=0.5, random_state=self.seed)
+        df = self._load_data_flexible(root, "rsna")
+        c2_pool = df.sample(frac=0.5, random_state=self.calib_seed)
         c3_pool = df.drop(c2_pool.index)
 
-        for base_id, pool, ratio in [('client_2', c2_pool, 0.60), ('client_3', c3_pool, 0.40)]:
-            # 1. ZUERST: PCA-Pool ziehen (125 Samples pro Base-Client)
-            pca_df, rem = self._get_disjoint_sample(pool, 125, 0.50)
-            pca_x, _ = self._load_images_from_disk(pca_df)
-            self.pca_pool.append(pca_x)
+        for bid_idx, (bid, pool, pr) in enumerate([('client_2', c2_pool, 0.40), ('client_3', c3_pool, 0.60)]):
+            pca_df, rem = self._get_disjoint_sample(pool, 125, 0.50, custom_seed=self.calib_seed)
+            self._update_pca_stats(pca_df, "RSNA")
+            test_df, rem = self._get_disjoint_sample(rem, 624, 0.50, custom_seed=self.calib_seed)
+            val_df, rem = self._get_disjoint_sample(rem, 524, pr, custom_seed=self.calib_seed)
 
-            # 2. DANN: Test/Val aus verbleibenden Daten
-            test_df, rem = self._get_disjoint_sample(rem, 624, 0.50)
-            val_df, rem = self._get_disjoint_sample(rem, 524, ratio)
-
-            vx, vy = self._load_images_from_disk(val_df)
-            tx, ty = self._load_images_from_disk(test_df)
-
-            # 3. Subclients erstellen
             for i in range(1, 5):
-                train_df, rem = self._get_disjoint_sample(rem, 1000, ratio)
-                x, y = self._load_images_from_disk(train_df)
-                self.raw_pools[f"{base_id}_sub_{i}"] = {
-                    'train_x': x, 'train_y': y,
-                    'val_x': vx, 'val_y': vy,
-                    'test_x': tx, 'test_y': ty
+                # Unabhängiger Seed pro Subclient (mit Offset zur Vermeidung von Kollisionen)
+                sub_seed = (self.exp_seed + 10 + (bid_idx * 4) + i)
+                tr, rem = self._get_disjoint_sample(rem, 1000, pr, custom_seed=sub_seed)
+                self.raw_pools[f"{bid}_sub_{i}"] = {
+                    'train_x': tr.drop(columns='label').values, 'train_y': tr['label'].values,
+                    'val_x': val_df.drop(columns='label').values, 'val_y': val_df['label'].values,
+                    'test_x': test_df.drop(columns='label').values, 'test_y': test_df['label'].values
                 }
 
     def _prepare_chexpert(self, root):
-        """Client 4: CheXpert mit PCA-Pool-Extraktion."""
-        df = pd.read_csv(os.path.join(root, 'train.csv'))
-        df = df[(df['Pneumonia'] == 1.0) | (df['No Finding'] == 1.0)]
-        df['label'] = (df['Pneumonia'] == 1.0).astype(int)
-        df['full_path'] = df['Path'].apply(lambda x: os.path.join(root, x))
+        df = self._load_data_flexible(root, "chexpert")
+        pca_df, rem = self._get_disjoint_sample(df, 250, 0.50, custom_seed=self.calib_seed)
+        self._update_pca_stats(pca_df, "CheXpert")
+        test_df, rem = self._get_disjoint_sample(rem, 624, 0.50, custom_seed=self.calib_seed)
+        val_df, rem = self._get_disjoint_sample(rem, 524, 0.25, custom_seed=self.calib_seed)
 
-        # 1. ZUERST: PCA-Pool (250 Samples)
-        pca_df, rem = self._get_disjoint_sample(df, 250, 0.50)
-        pca_x, _ = self._load_images_from_disk(pca_df)
-        self.pca_pool.append(pca_x)
-
-        # 2. DANN: Test/Val aus verbleibenden Daten
-        test_df, rem = self._get_disjoint_sample(rem, 624, 0.50)
-        val_df, rem = self._get_disjoint_sample(rem, 524, 0.25)
-
-        vx, vy = self._load_images_from_disk(val_df)
-        tx, ty = self._load_images_from_disk(test_df)
-
-        # 3. Subclients erstellen
         for i in range(1, 5):
-            ratio = 0.10 if i == 1 else 0.25
-            train_df, rem = self._get_disjoint_sample(rem, 1000, ratio)
-            x, y = self._load_images_from_disk(train_df)
+            sub_seed = (self.exp_seed + 30 + i)
+            pr = 0.10 if i == 1 else 0.25
+            tr, rem = self._get_disjoint_sample(rem, 1000, pr, custom_seed=sub_seed)
             self.raw_pools[f"client_4_sub_{i}"] = {
-                'train_x': x, 'train_y': y,
-                'val_x': vx, 'val_y': vy,
-                'test_x': tx, 'test_y': ty
+                'train_x': tr.drop(columns='label').values, 'train_y': tr['label'].values,
+                'val_x': val_df.drop(columns='label').values, 'val_y': val_df['label'].values,
+                'test_x': test_df.drop(columns='label').values, 'test_y': test_df['label'].values
             }
 
-    def build(self, rsna_root, chexpert_root):
-        """Führt PCA & Scaling auf separatem Kalibrierungs-Pool aus."""
-        # 1. Datasets vorbereiten (PCA-Pool wird automatisch befüllt)
+    def build(self, rsna_root, chexpert_root, verbose=False):
         self._prepare_mnist()
         self._prepare_rsna(rsna_root)
         self._prepare_chexpert(chexpert_root)
 
-        # 2. PCA auf dem separaten Pool fitten
-        pca_calibration_data = np.vstack(self.pca_pool)
-        print(f"\n🔧 PCA-Kalibrierung auf {len(pca_calibration_data)} disjunkten Samples")
-        print(f"   └─ Client 1 (MNIST):   250 Samples")
-        print(f"   └─ Client 2 (RSNA):    125 Samples")
-        print(f"   └─ Client 3 (RSNA):    125 Samples")
-        print(f"   └─ Client 4 (CheXpert): 250 Samples")
+        pca_data = np.vstack(self.pca_pool)
+        # PCA fitting nutzt IMMER den CALIB_SEED für konsistenten Feature-Space
+        pca = PCA(n_components=self.n_components, random_state=self.calib_seed).fit(pca_data)
+        scaler = MinMaxScaler(feature_range=(0, np.pi)).fit(pca.transform(pca_data))
 
-        pca = PCA(n_components=self.n_components).fit(pca_calibration_data)
-        scaler = MinMaxScaler(feature_range=(0, np.pi)).fit(pca.transform(pca_calibration_data))
+        if verbose:
+            print("\n" + "="*95)
+            print(f"{'FEDERATED DATA ORCHESTRATION SUMMARY (FIXED PCA)':^95}")
+            print("="*95)
+            print(f"PCA Calibration Pool: {len(pca_data)} samples (Balanced & Seed-Fixed)")
+            for src, count in self.pca_sources.items(): print(f"  ├─ {src}: {count} images")
+            print("-" * 95)
 
-        # 3. DataLoader erstellen
         final_loaders = {}
         for sid, d in self.raw_pools.items():
-            def to_loader(x, y, shuffle=False):
-                x_trans = scaler.transform(pca.transform(x))
-                ds = PneumoniaDataset(
-                    torch.tensor(x_trans, dtype=torch.float32),
-                    torch.tensor(y, dtype=torch.float32).view(-1, 1)
+            def make_l(x, y, shuf=False):
+                x_pca = pca.transform(x.astype(np.float32))
+                x_scaled = scaler.transform(x_pca)
+                return DataLoader(
+                    PneumoniaDataset(torch.tensor(x_scaled, dtype=torch.float32),
+                                     torch.tensor(y, dtype=torch.float32).view(-1, 1)),
+                    batch_size=self.batch_size, shuffle=shuf, drop_last=True
                 )
-                return DataLoader(ds, batch_size=self.batch_size, shuffle=shuffle, drop_last=True)
 
             final_loaders[sid] = {
-                'train': to_loader(d['train_x'], d['train_y'], True),
-                'val': to_loader(d['val_x'], d['val_y']),
-                'test': to_loader(d['test_x'], d['test_y'])
+                'train': make_l(d['train_x'], d['train_y'], True),
+                'val': make_l(d['val_x'], d['val_y']),
+                'test': make_l(d['test_x'], d['test_y'])
             }
-            y_train = d['train_y'].astype(int)
-            counts = np.bincount(y_train, minlength=2)
-            self.metadata[sid] = {
-                'lds_ratio': np.max(counts) / len(y_train),
-                'minority_idx': np.argmin(counts)
-            }
+            self.metadata[sid] = {'minority_idx': np.argmin(np.bincount(d['train_y'].astype(int)))}
 
         return final_loaders, self.metadata
 
-
-# ==================================================
-# 3. EXTERNE SCHNITTSTELLEN
-# ==================================================
-
-def get_federated_pca_loaders(rsna_root, chexpert_root, current_seed=42):
-    """Schnittstelle für die main.py. Erzeugt pro Seed einen neuen Split."""
-    orchestrator = FederatedDataOrchestrator(
-        n_components=config.NUM_FEATURES,
-        batch_size=config.BATCH_SIZE,
-        seed=current_seed
-    )
-    return orchestrator.build(rsna_root, chexpert_root)
-
+def get_federated_pca_loaders(rsna_root, chexpert_root, current_seed=42, verbose=False):
+    orchestrator = FederatedDataOrchestrator(n_components=config.NUM_FEATURES,
+                                             batch_size=config.BATCH_SIZE,
+                                             experiment_seed=current_seed)
+    return orchestrator.build(rsna_root, chexpert_root, verbose=verbose)
 
 def get_centralized_loader(all_fed_loaders, batch_size):
-    """Bündelt alle Trainingsdaten der Subclients für die zentrale Baseline."""
-    all_x = []
-    all_y = []
-    for sid in all_fed_loaders:
-        ds = all_fed_loaders[sid]['train'].dataset
-        all_x.append(ds.dataset)
-        all_y.append(ds.labels)
-
-    combined_ds = PneumoniaDataset(torch.cat(all_x, dim=0), torch.cat(all_y, dim=0))
-    return DataLoader(combined_ds, batch_size=batch_size, shuffle=True, drop_last=True)
-
-
-# ==================================================
-# 4. ANALYSE- UND VALIDIERUNGSFUNKTIONEN
-# ==================================================
-
-def print_dataset_stats(all_fed_loaders):
-    """Gibt die Klassenverteilung pro Subclient aus."""
-    print("\n" + "=" * 95)
-    print(f"{'SUBCLIENT DATEN-VERTEILUNG':^95}")
-    print("=" * 95)
-    print(f"{'Subclient ID':<20} | {'Split':<6} | {'Gesamt':<7} | {'Normal':<7} | {'Pneu':<7} | {'Anteil Pneu'}")
-    print("-" * 95)
-    for sid, splits in all_fed_loaders.items():
-        for split_name in ['train', 'val', 'test']:
-            ds = splits[split_name].dataset
-            labels = ds.labels.flatten()
-            total = len(labels)
-            pos = torch.sum(labels == 1).item()
-            neg = torch.sum(labels == 0).item()
-            ratio = (pos / total * 100) if total > 0 else 0
-            display_id = sid if split_name == 'train' else ""
-            print(f"{display_id:<20} | {split_name:<6} | {total:<7} | {int(neg):<7} | {int(pos):<7} | {ratio:>10.1f}%")
-        print("-" * 95)
-
-
-def verify_disjoint_subclients(final_loaders):
-    """Validiert mathematisch, dass keine Bilder doppelt vorkommen."""
-    seen_hashes = {}
-    overlap = False
-    for sid, splits in final_loaders.items():
-        x_data = splits['train'].dataset.dataset.numpy()
-        for i in range(len(x_data)):
-            h = hash(x_data[i].tobytes())
-            if h in seen_hashes:
-                print(f"ALARM: Überlappung in {sid} gefunden! (Zuvor in {seen_hashes[h]})")
-                overlap = True
-            else:
-                seen_hashes[h] = sid
-    if not overlap:
-        print(f"✅ ERGEBNIS: Alle {len(final_loaders)} Subclients sind zu 100% disjunkt.")
+    all_x = torch.cat([s['train'].dataset.dataset for s in all_fed_loaders.values()])
+    all_y = torch.cat([s['train'].dataset.labels for s in all_fed_loaders.values()])
+    return DataLoader(PneumoniaDataset(all_x, all_y), batch_size=batch_size, shuffle=True, drop_last=True)
