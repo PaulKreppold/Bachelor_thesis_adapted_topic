@@ -11,7 +11,7 @@ def get_pneumonia_mnist_loaders(batch_size=32):
     DataClass = getattr(medmnist, info['python_class'])
 
     transform = transforms.Compose([
-        transforms.Resize((28, 28)),
+        transforms.Resize((16, 16)),
         transforms.ToTensor(),
     ])
 

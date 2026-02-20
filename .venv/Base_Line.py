@@ -43,7 +43,7 @@ class QuantumModel(nn.Module):
         nn.init.normal_(self.qlayer.weights, mean=0.0, std=0.1)
 
     def forward(self, x):
-        x = x.view(-1, 784)
+        x = x.view(-1, 256)
 
         # [batch_size, num_qubits]
         q_out = self.qlayer(x)
