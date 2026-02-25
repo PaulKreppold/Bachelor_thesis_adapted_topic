@@ -23,20 +23,21 @@ os.makedirs(BASE_RESULTS_DIR, exist_ok=True)
 
 # --- HYPERPARAMETER ---
 CALIBRATION_SEED = 42
-RANDOM_SEEDS = [42, 117, 52, 31]
-PROBS = [0.01, 0.03, 0.05, 0.1]
+RANDOM_SEEDS = [42, 117, 52, 31, 10]
+PROBS = [0.1, 0.05, 0.03, 0.01]
+
 NUM_QUBITS = 4
-DEFAULT_LAYERS = 4
 NUM_FEATURES = NUM_QUBITS * 2
+TWO_QUBIT_NOISE_FACTOR = 5.0
+DEFAULT_LAYERS = 4
+
 BATCH_SIZE = 16
 LEARNING_RATE = 0.001
 GLOBAL_ROUNDS = 5
 LOCAL_EPOCHS = 3
 BASELINE_EPOCHS = GLOBAL_ROUNDS * LOCAL_EPOCHS
 
-# Clients
-BASE_CLIENTS = ["client_1", "client_2", "client_3", "client_4"]
-ALL_SUBCLIENTS = [f"client_{c}_sub_{s}" for c in range(1,5) for s in range(1,5)]
+ALL_SUBCLIENTS = [f"client_{c}_sub_{s}" for c in range(1, 5) for s in range(1, 5)]
 
 ALL_SCENARIOS = []
 def add_s(group, label, cfg):
