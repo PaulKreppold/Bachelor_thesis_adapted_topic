@@ -10,18 +10,14 @@ from sklearn.preprocessing import MinMaxScaler
 import torch.nn.functional as F
 import medmnist
 
-# =============================================================================
-# 1. KONFIGURATION
-# =============================================================================
+#Konfiguration
 MY_SEEDS = [42, 117, 52, 31, 10]
 CALIBRATION_SEED = 42
 BASE_DIR = "ablation_results_final"
 os.makedirs(BASE_DIR, exist_ok=True)
 
 
-# =============================================================================
-# 2. DATA PREPARATION (PRÄZISE DIMENSIONEN)
-# =============================================================================
+#Datenvorverarbeitung
 def get_scientific_data(dataset_name, mode, n_qubits, subset_size=1000):
     rng = np.random.RandomState(CALIBRATION_SEED)
 
@@ -76,9 +72,7 @@ def get_scientific_data(dataset_name, mode, n_qubits, subset_size=1000):
     return train_ds, val_ds
 
 
-# =============================================================================
-# 3. VQC MODELL (STRUKTUR AUS BASE_LINE.PY ÜBERNOMMEN)
-# =============================================================================
+#VQC-Modell -> orientiert sich an Struktur der Quantenmodell-Klasse Base_Line.py
 class AblationVQC(nn.Module):
     def __init__(self, n_qubits, n_layers, encoding, ansatz, measure):
         super().__init__()
@@ -97,7 +91,7 @@ class AblationVQC(nn.Module):
             weight_shapes = {"weights": (n_layers, n_qubits)}
 
         def circuit(inputs, weights):
-            # ENCODING
+            # Kodierung
             if self.encoding == "AE":
                 qml.AmplitudeEmbedding(inputs, wires=range(self.n_qubits), normalize=True, pad_with=0.0)
             else:
@@ -148,13 +142,10 @@ class AblationVQC(nn.Module):
             return ((q_out_mean + 1) / 2).view(-1, 1)
         else:
             # Softmax-Logik für "soft" Szenarien (Sanity MNIST/Baseline)
-            # Wir nutzen die ersten zwei Qubits als Logits
+            # Nutzung der ersten beiden Qubits als Logits
             return F.softmax(q_out[:, :2], dim=1)[:, 1].view(-1, 1)
 
 
-# =============================================================================
-# 4. RUNNER
-# =============================================================================
 def run_matrix():
     MATRIX = [
         {"ds": "MNIST", "q": 10, "enc": "AE", "ans": "HE", "l": 15, "m": "soft", "lbl": "1_Suenkel_Sanity_MNIST"},
@@ -165,18 +156,20 @@ def run_matrix():
         {"ds": "Pneumonia", "q": 4, "enc": "PCA", "ans": "StronglyEntangling", "l": 4, "m": "mean",
          "lbl": "5_PCA_Baseline_4Q"},
         {"ds": "Pneumonia", "q": 10, "enc": "PCA", "ans": "StronglyEntangling", "l": 4, "m": "mean",
-         "lbl": "6_PCA_Final_Target"}
+         "lbl": "6_PCA_Final_Target"},
+        {"ds": "Pneumonia", "q": 10, "enc": "PCA", "ans": "StronglyEntangling", "l": 12, "m": "mean",
+         "lbl": "7_PCA_HighCapacity_10Q_12L"}
     ]
 
     for conf in MATRIX:
-        print(f"\n🚀 Szenario: {conf['lbl']}")
+        print(f"Szenario: {conf['lbl']}")
         scenario_dir = os.path.join(BASE_DIR, conf["lbl"])
         os.makedirs(scenario_dir, exist_ok=True)
 
         train_ds, val_ds = get_scientific_data(conf["ds"], conf["enc"], conf["q"])
 
         for seed in MY_SEEDS:
-            print(f"   🔁 Seed {seed}")
+            print(f"Seed {seed}")
             torch.manual_seed(seed)
             np.random.seed(seed)
 
@@ -220,7 +213,6 @@ def run_matrix():
             torch.save(model.state_dict(), os.path.join(scenario_dir, f"seed_{seed}_model.pt"))
             with open(os.path.join(scenario_dir, f"seed_{seed}.json"), "w") as f:
                 json.dump({"config": conf, "metrics": history}, f, indent=4)
-            print(f"   ✅ Seed {seed} fertig.")
 
 
 if __name__ == "__main__":

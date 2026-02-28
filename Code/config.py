@@ -103,7 +103,7 @@ for p_out in [0.05, 0.1]:
                "mapping": {"client_1": (nt_out, p_out)}})
 
 # =============================================================================
-# 4. ABLATIONS (3) - Methodik-Check
+# 4. ABLATIONS (4) - Methodik-Check
 # =============================================================================
 for mode in ["uniform", "gate_dependent"]:
     add_s("ablation", f"MODE_CHECK_{mode.upper()}",

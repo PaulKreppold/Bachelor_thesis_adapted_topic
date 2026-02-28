@@ -1,6 +1,7 @@
-# Trainings- als auch Evaluationsloop
-#für LDS, Rauschrobustheit und Konvergenzanalyse
-
+"""
+Enhanced Evaluation Module with Comprehensive Metrics
+for LDS, Noise Robustness, and Convergence Analysis
+"""
 
 import torch
 import numpy as np
@@ -17,15 +18,15 @@ from sklearn.metrics import (
 
 
 def evaluate_model(model, data_loader, device, minority_idx=None):
+    """
+    Comprehensive model evaluation with LDS and noise robustness metrics.
 
-    #Modell Evaluation -> LDS und Rauschrobustheitsmetriken
-
-    #Liefert Metriken für:
-    #1. medizinische Diagnose (Sensitivität, Spezifität)
-    #2. LDS Analyse (Performance der Minderheitsklasse, Ungleichverteilung der Klasen)
-    #3. Rauschrobustheit (AUC, Verlust, Konfidenz)
-    #4. Fairness (Macro-averaged-Metriken, performance gap)
-
+    Returns metrics for:
+    1. Medical diagnostics (Sensitivity, Specificity)
+    2. LDS analysis (Minority class performance, class imbalance)
+    3. Noise robustness (AUC, loss, confidence)
+    4. Fairness (Macro-averaged metrics, performance gap)
+    """
     model.eval()
     criterion = torch.nn.BCELoss()
 
@@ -48,27 +49,31 @@ def evaluate_model(model, data_loader, device, minority_idx=None):
             all_probs.extend(outputs.detach().cpu().numpy().flatten())
             all_targets.extend(targets.cpu().numpy().flatten())
 
-    # Umwandlung in NumPy Array
+    # Convert to numpy
     all_targets = np.array(all_targets, dtype=int)
     all_probs = np.array(all_probs, dtype=float)
     all_preds = (all_probs >= 0.5).astype(int)
 
-    #Analyse der Klassenverteilung -> LDS
+    # -------------------------------------------------------------------------
+    # CLASS DISTRIBUTION ANALYSIS (Critical for LDS)
+    # -------------------------------------------------------------------------
     counts = np.bincount(all_targets, minlength=2)
 
-    # Minderheitsklasse ermitteln
+    # Auto-detect minority class
     if minority_idx is None:
         minority_idx = np.argmin(counts) if counts[0] != counts[1] else 1
 
     majority_idx = 1 - minority_idx
 
-    # Quantifizierung der Ungleichverteilung
+    # Quantify imbalance
     if counts[minority_idx] > 0:
         imbalance_ratio = counts[majority_idx] / counts[minority_idx]
     else:
         imbalance_ratio = float('inf')
 
-    #Klassen-Metriken
+    # -------------------------------------------------------------------------
+    # PER-CLASS METRICS
+    # -------------------------------------------------------------------------
     prec, rec, f1, support = precision_recall_fscore_support(
         all_targets, all_preds, labels=[0, 1], average=None, zero_division=0
     )
@@ -146,28 +151,30 @@ def evaluate_model(model, data_loader, device, minority_idx=None):
         'roc_auc_global': roc_auc,
         'pr_auc_c1': pr_auc_c1,
 
-        # Welche Konfidenz hat das Modell?
-        'avg_confidence': float(np.mean(np.maximum(all_probs, 1 - all_probs))),
+        # Calibration (how confident is the model?)
+        'avg_confidence': float(np.mean(np.maximum(all_probs, 1 - all_probs))),  # NEW
 
-        #detaillierte Analyse
+        # =====================================================================
+        # DETAILED ANALYSIS
+        # =====================================================================
         'confusion_matrix': cm.tolist(),
-        'true_positives': int(tp),   # Wahr-Positiv
-        'true_negatives': int(tn),   # Wahr-Negativ
-        'false_positives': int(fp),  # Falsch-Positiv
-        'false_negatives': int(fn),  # Falsch-Negativ
+        'true_positives': int(tp),   # NEW: Explicit CM values
+        'true_negatives': int(tn),   # NEW
+        'false_positives': int(fp),  # NEW
+        'false_negatives': int(fn),  # NEW
 
         'minority_idx': int(minority_idx)
     }
 
 
 def train_local_model(model, train_loader, val_loader, optimizer, epochs, device, client_id=""):
+    """
+    Enhanced training with convergence and stability metrics.
 
-    #Enhanced training with convergence and stability metrics.
-
-    #Returns:
-        #weights: Model state dict
-        #history: History welche auch Konvergenzmetriken umfasst
-
+    Returns:
+        weights: Model state dict
+        history: Extended history with convergence metrics
+    """
     model.train()
     criterion = torch.nn.BCELoss()
 
@@ -176,13 +183,15 @@ def train_local_model(model, train_loader, val_loader, optimizer, epochs, device
         'train_acc': [],
         'val_loss': [],
         'val_acc': [],
-        'epoch_times': []
+        'epoch_times': []  # NEW: Track time per epoch
     }
 
     for epoch in range(epochs):
         epoch_start = datetime.now()
 
-        #Trainingsphase
+        # ---------------------------------------------------------------------
+        # Training Phase
+        # ---------------------------------------------------------------------
         model.train()
         running_loss = 0.0
         correct = 0
@@ -206,7 +215,9 @@ def train_local_model(model, train_loader, val_loader, optimizer, epochs, device
         history['train_loss'].append(running_loss / total)
         history['train_acc'].append(correct / total)
 
-        #Validierung
+        # ---------------------------------------------------------------------
+        # Validation Phase
+        # ---------------------------------------------------------------------
         model.eval()
         val_loss = 0.0
         val_correct = 0
@@ -225,11 +236,13 @@ def train_local_model(model, train_loader, val_loader, optimizer, epochs, device
         history['val_loss'].append(val_loss / val_total)
         history['val_acc'].append(val_correct / val_total)
 
-        # Tracking der Epochenzeit
+        # Track epoch time
         epoch_time = (datetime.now() - epoch_start).total_seconds()
         history['epoch_times'].append(epoch_time)
 
-        #Logging -> Begrenzung da AWS-Parallelisierung
+        # ---------------------------------------------------------------------
+        # Logging (only final epoch for AWS parallelization)
+        # ---------------------------------------------------------------------
         if (epoch + 1) == epochs:
             now = datetime.now().strftime("%H:%M:%S")
             pid = os.getpid()
@@ -242,7 +255,10 @@ def train_local_model(model, train_loader, val_loader, optimizer, epochs, device
                   f"Val Loss: {history['val_loss'][-1]:.4f} | "
                   f"Time: {epoch_time:.1f}s")
 
-    #Analyse der Konvergenz & Stabilität -> nach dem Training
+    # -------------------------------------------------------------------------
+    # POST-TRAINING ANALYSIS (Convergence & Stability)
+    # -------------------------------------------------------------------------
+    # WICHTIG: Nutzt jetzt die unified Funktion mit dem Modus "local"
     history['convergence_metrics'] = compute_unified_convergence_metrics(
         history,
         mode="local"
@@ -258,17 +274,18 @@ def compute_unified_convergence_metrics(
     stability_window: int = 5,
     plateau_tol: float = 0.01
 ):
+    """
+    Unified convergence metrics for:
+    - centralized
+    - local
+    - federated (round-aware)
 
-    #Konvergenzmetriken für:
-    # - zentralisiert
-    # - lokal
-    # - föderiert
-
-    #mode entspricht zentral, lokal bzw. föderiert
+    mode ∈ {"central", "local", "federated"}
+    """
 
     val_losses = np.array(history['val_loss'])
 
-    # Achse für den Vergleich
+    # --- 1. Effektive Vergleichsachse definieren ---
     if mode == "federated":
         if local_epochs is None:
             raise ValueError("local_epochs required for federated mode")
@@ -280,13 +297,13 @@ def compute_unified_convergence_metrics(
     n = len(eff_losses)
     window = min(stability_window, n)
 
-    # Standardmetriken
+    # --- 2. Grundmetriken (für alle gleich interpretiert) ---
     final_loss = float(eff_losses[-1])
     total_improvement = float(eff_losses[0] - eff_losses[-1])
     improvement_per_step = float(total_improvement / max(1, n - 1))
     stability_std = float(np.std(eff_losses[-window:]))
 
-    # Bestimmung des Punktes der Konvergenz
+    # --- 3. Konvergenzpunkt (Plateau-Detection) ---
     plateau_step = None
     for i in range(window, n):
         if np.std(eff_losses[i - window:i]) < plateau_tol:

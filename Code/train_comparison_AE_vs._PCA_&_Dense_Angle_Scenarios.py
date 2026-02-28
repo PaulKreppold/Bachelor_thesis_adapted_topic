@@ -65,21 +65,25 @@ def plot_final_ablation(base_path, scenarios, labels):
 
 # Absolute Pfade und Szenarien
 BASE_PATH = "/Users/paulkreppold/python_projects/SWM/Bachelor_thesis_adapted_topic/Code/ablation_results_final"
+
 scenarios = [
     '1_Suenkel_Sanity_MNIST',
     '2_Suenkel_Baseline_AE',
     '3_AE_MaxExpressive_12L',
     '4_AE_InfoLoss_4Q',
     '5_PCA_Baseline_4Q',
-    '6_PCA_Final_Target'
+    '6_PCA_Final_Target',      # Komma hier war wichtig!
+    '7_PCA_HighCapacity_10Q_12L'
 ]
+
 labels = [
-    "MNIST AE (Basistest)",
-    "PneumoniaMNIST AE (10Q HEA-Basislinie)",
-    "PneumoniaMNIST AE (12L + SVS)",
-    "PneumoniaMNIST AE (4Q Inf.-Verlust)",
-    "PneumoniaMNIST PCA + DWK (4Q Basislinie)",
-    "PneumoniaMNIST PCA + DWK (10Q Zielmodell)"
+    "MNIST: AE (Basistest)",
+    "AE: 10Q, HEA (L=15)",
+    "AE: 10Q, SVS (L=12)", # Der "alte" High-End Versuch
+    "AE: 4Q, HEA (L=4)",
+    "PCA+DWK: 4Q, SVS (L=4)", # Dein finales Rausch-Modell
+    "PCA+DWK: 10Q, SVS (L=4)",
+    "PCA+DWK: 10Q, SVS (L=12)" # Der "faire Vergleich" zu Label 3
 ]
 
 plot_final_ablation(BASE_PATH, scenarios, labels)
